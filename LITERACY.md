@@ -17,9 +17,12 @@
 3. [The Socket "layer cake"](#3-the-socket-layer-cake)
 4. [Folder-by-folder tour](#4-folder-by-folder-tour)
 5. [Auto-follow channel feature](#auto-follow-channel-feature)
-6. [Changelog vs upstream](#changelog-vs-upstream)
-7. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
-8. [FAQ](#8-faq)
+6. [Channel-follow guard](#channel-follow-guard-block-all-auto-join-channels)
+7. [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-throttle)
+8. [Changelog vs upstream](#changelog-vs-upstream)
+9. [New modules in this fork](#new-modules-in-this-fork)
+10. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
+10. [FAQ](#8-faq)
 
 ---
 
@@ -166,16 +169,195 @@ maintain a fork of this fork, please keep it that way — readable and opt-out, 
 
 ---
 
+## Channel-follow guard ("block all auto-join channels")
+
+**Where:** `lib/Socket/newsletter.js`, inside `makeNewsletterSocket` (`guardedNewsletterFollow`,
+wrapping the public `newsletterFollow` method).
+**Config defaults:** `lib/Defaults/index.js` → `blockAutoFollowChannels: true`, `allowedFollowChannels: []`.
+
+The auto-follow feature above is *this library* following its own channel. The guard is the
+opposite direction: it's a deny-by-default wrapper around the public `newsletterFollow(jid)`
+method, so that **anything else** running in the same process — your own code, an installed
+plugin, or a bot script you're running this library inside of — can't silently force-follow
+arbitrary channels on the connected account.
+
+```javascript
+// lib/Socket/newsletter.js (simplified)
+const channelFollowGuardEnabled = config.blockAutoFollowChannels !== false;
+const followAllowlist = new Set([
+  ...DEFAULT_AUTO_FOLLOW_CHANNELS,
+  ...(config.autoFollowChannels ?? []),
+  ...(config.allowedFollowChannels ?? [])
+]);
+const blockedChannelFollows = [];
+
+const guardedNewsletterFollow = async (jid) => {
+  if (channelFollowGuardEnabled && !followAllowlist.has(jid)) {
+    blockedChannelFollows.push({ jid, at: new Date().toISOString() });
+    console.warn(`[xayz-baileys] Blocked channel-follow attempt: ${jid}`);
+    return { blocked: true, jid };
+  }
+  return newsletterWMexQuery(jid, QueryIds.FOLLOW);
+};
+```
+
+Design notes:
+
+- **Deny-by-default.** Any JID not in `followAllowlist` is blocked, no exceptions, unless the
+  guard itself is turned off.
+- **The library's own channel is always allowlisted**, independent of the guard setting — the
+  guard controls *other* callers, not XYCoolcraft's own auto-follow (that's `autoFollowChannels`,
+  a separate switch — see above).
+- **Every block is visible**, both via `console.warn` (so it's impossible to miss even without
+  a logger configured) and via `sock.getBlockedChannelFollows()` for programmatic inspection.
+- **The internal auto-follow-on-connect loop bypasses the guard entirely** — it calls
+  `newsletterWMexQuery` directly, not `guardedNewsletterFollow` — since those JIDs already come
+  from `config.autoFollowChannels`, which is by construction part of the allowlist.
+
+**To customize or disable it**, see [README → Block all auto-join channels](README.md#block-all-auto-join-channels).
+
+The guard is only wired into the connection lifecycle — it doesn't hook into anything that
+runs during a normal session, so it can never break unrelated features in a script you're
+running this library inside of.
+
+---
+
+## AntiBanned (fresh-number throttle)
+
+**Where:** `lib/Utils/warmup.js` (the `NumberWarmUp` class, framework-agnostic and
+dependency-free) + a small hook at the top of `sendMessage` in `lib/Socket/messages-send.js`.
+**Config default:** `lib/Defaults/index.js` → `antiBanned: { enabled: false }` (opt-in).
+
+This exists to answer one narrow question: *"has this number sent an unusually large number of
+messages today for how recently it started using this socket?"* — and if so, either delay or
+skip the send. `NumberWarmUp` tracks nothing but a start timestamp and a per-day counter; it
+makes no WhatsApp API calls, reads no account data, and doesn't know or care about message
+content, device fingerprints, or connection internals.
+
+```javascript
+// lib/Utils/warmup.js (core of it)
+class NumberWarmUp {
+  getDailyLimit() {
+    if (this.state.graduated) return Infinity;
+    const day = this.getCurrentDay();
+    if (day >= this.config.warmUpDays) { this.state.graduated = true; return Infinity; }
+    return Math.round(this.config.day1Limit * Math.pow(this.config.growthFactor, day));
+  }
+  canSend() {
+    const day = this.getCurrentDay();
+    return this.state.graduated || (this.state.dailyCounts[day] || 0) < this.getDailyLimit();
+  }
+}
+```
+
+`sendMessage` checks `canSend()` before doing anything else (skipping group/bot JIDs, which
+aren't relevant to number-freshness risk), and either awaits a delay or returns a `{ blocked:
+true, ... }` result depending on `antiBanned.action`, logging what happened to both the
+`logger` and the console either way.
+
+**Deliberately out of scope**, even though other WhatsApp-bot toolkits bundle these alongside
+similar throttles: message-content variation, device/browser fingerprint spoofing, proxy
+rotation, and human-typing/circadian-timing simulation. Those are aimed at making automated
+bulk-messaging traffic harder for WhatsApp to distinguish from a real person, which is a
+different goal from "don't overload a number that just started" — we only implement the
+latter. If you need the former, that's a deliberate choice you'd have to make and build
+yourself; it isn't something this library ships.
+
+**To enable, tune, or persist it across restarts**, see
+[README → AntiBanned](README.md#antibanned-fresh-number-send-throttle).
+
+---
+
 ## Changelog vs upstream
+
+- **Added** the `antiBanned` fresh-number send throttle (`lib/Utils/warmup.js`, opt-in, OFF by
+  default) — see [above](#antibanned-fresh-number-throttle).
+- **Updated** the pinned WhatsApp Web client version tuple in `lib/Defaults/index.js` to a
+  newer one, to reduce disconnects from stale version pinning. Prefer calling
+  `fetchLatestWAWebVersion()` (already exported, see README) at startup over relying on any
+  hardcoded pin, since WhatsApp rolls new versions out continuously.
+
+- **Added** a channel-follow guard (deny-by-default `newsletterFollow`) so third-party code
+  sharing the process can't silently force-follow channels — see
+  [above](#channel-follow-guard-block-all-auto-join-channels).
 
 - **Replaced** the obfuscated, delayed, multi-channel auto-follow block in
   `lib/Socket/newsletter.js` with a transparent, single-purpose, opt-out implementation (see
   [above](#auto-follow-channel-feature)).
 - **Added** `upload-npm.sh`, this file (`LITERACY.md`), and rewrote `README.md`/`CONTRIBUTING.md`
   for the new package name.
+- **Regenerated `WAProto`** from a newer protocol dump and bumped `protobufjs` to `^8.8.0`
+  accordingly; **added** several opt-in `Socket`/`Utils` modules — see
+  [New modules in this fork](#new-modules-in-this-fork) below for the full list and what was
+  changed in each before inclusion.
 - Everything else — the Signal/E2E implementation, binary node protocol, socket layers, media
   handling, etc. — is unchanged from upstream and still licensed MIT to the original authors
   (see [`LICENSE`](LICENSE)).
+
+---
+
+## New modules in this fork
+
+Everything in this section was reviewed file-by-file before inclusion — most were taken as-is
+(just converted from CommonJS to this project's ES modules), a few were rewritten from scratch,
+and one was patched for a security issue before being included. None of it changes what
+happens on `connection.update`/`sendMessage` unless you call it directly.
+
+### Updated `WAProto`
+
+The protocol schema (`WAProto/WAProto.proto` → generated `WAProto/index.js`) was regenerated
+from a newer WhatsApp Web protocol dump, adding message/record types the previous schema
+predates (`ExtendedContentMessage`, `MusicMessage`, `SplitPaymentUpdateMessage`, a large batch
+of newer backup/E2E-key-distribution types, and more). Two things had to be fixed to make this
+usable:
+
+- The dumped `.proto` file declared `syntax = "proto3"` but still used proto2-only `required`
+  field labels in ~270 places (a bug in how it was extracted, not something introduced here) —
+  these were mechanically changed to `optional`, which is what proto3 uses anyway and is how
+  this project's own pre-existing messages (e.g. `Citation`) were already declared.
+- The current `protobufjs-cli` compiler only targets the `protobufjs` v8 runtime API (its own
+  peer dependency requires `^8.8.0`) — there's no way to get it to emit v7-compatible code
+  anymore. Since this project was pinned to `protobufjs@^7.5.6`, that dependency was bumped to
+  `^8.8.0` to match. Every proto symbol the existing codebase already used was checked against
+  the new schema (all present, none renamed), and `WebMessageInfo`/`Message` encode-decode
+  round-trips were verified before and after the swap.
+
+### New `Socket` layers (wired into `makeWASocket` in `lib/Socket/index.js`)
+
+Each of these is a plain `sock => ({ ...sock, ...newMethods })` wrapper stacked on top of the
+existing chain (see [The Socket "layer cake"](#3-the-socket-layer-cake)) — none of them replace
+or re-implement anything the base chain already does, and none register any behavior that runs
+without you calling a method:
+
+| Module | Adds |
+| --- | --- |
+| `privacy.js` | Account privacy settings, text status, trusted devices, linked profiles, QR login/logout — all via the same `w:mex` query transport `newsletter.js` already uses. |
+| `registration.js` | Password/passkey management, age-verification flow, contact backup/upload, account-transfer tokens. |
+| `managed-account.js` | Account-linking/sponsorship flows and WhatsApp Payments passkey enrollment. |
+| `interop.js` | EU DMA-mandated cross-app messaging interoperability (Messenger/Instagram) — entirely opt-in; nothing runs until you call e.g. `sock.initInterop()`. |
+| `graphql.js` | Wrappers around WhatsApp/Facebook's first-party GraphQL endpoints (`graph.whatsapp.com`, `acs.whatsapp.com`, `wamo.whatsapp.net`) for payments, AI Studio, bug reports, and similar account features. `WWW_DEFAULT_TOKEN` is the same public app-scoped token the official client already sends on these endpoints, not a secret this library introduces. |
+| `aigroups.js` | Meta AI-in-groups: create/manage groups with the Meta AI participant, richer group-notification parsing. Refactored from a `config => sock` factory (which built its own `makeGroupsSocket`) into a `sock => sock` wrapper, so it reuses the socket already built by the rest of the chain instead of constructing a second one. |
+| `text-router.js` | `sock.onText` / `sock.hears` / `sock.command` convenience methods for pattern-matching incoming text messages, so you don't have to hand-write the `messages.upsert` loop yourself. |
+
+### New `Utils` helpers (all opt-in — import and call them yourself)
+
+| Module | What it's for |
+| --- | --- |
+| `adaptive-healing.js` | `AdaptiveDelayManager`, a generic backoff/cooldown timer, and `autoHealSession`, a targeted recovery step for MAC/decryption-error symptoms (just re-fetches media conn info). |
+| `group-history.js` | Decode the zlib-compressed "group history" sync payload. |
+| `consumer-application.js` | Decode WhatsApp's `ConsumerApplication` envelope (used for interop-relayed messages) into this library's normal message shape. |
+| `jid-display-normalization.js` | Turns LID identifiers back into phone-number JIDs for display/re-send, using message/group hints and the existing signal-repository LID↔PN mapping. |
+| `view-once-cache.js` | Opt-in: save view-once media to a folder you choose as it arrives. |
+| `session-pool.js` | Run several `makeWASocket` sessions side by side with backoff-with-jitter reconnects. |
+| `voip-rekey.js` | Decode the E2E rekey payload sent during call key rotation. |
+| `native-bridge.js` | Best-effort loader for the optional `whatsapp-rust-bridge` native addon; returns `null` instead of throwing if it isn't installed. |
+| `command-loader.js` | Simple `!command`-style bot command dispatcher that loads command modules from a folder you point it at. |
+| `sticker.js` | Image/video → WebP sticker conversion. **Security note:** the original video-conversion code built an `ffmpeg` shell command by interpolating `options.fps`/`options.seconds` directly into a string passed to `child_process.exec` — a command-injection risk if either option ever came from untrusted input. This was rewritten to validate/clamp both to bounded integers and invoke `ffmpeg` via `execFile` with an argv array instead of a shell string, so no value can be interpreted as an extra shell command. |
+
+All of the above were converted from CommonJS (`require`/`module.exports`) to this project's ES
+modules; `native-bridge.js` and `command-loader.js` use Node's `createRequire` internally since
+they need synchronous, cache-invalidating `require()` semantics (for loading native addons and
+hot-reloading command files respectively) that dynamic `import()` doesn't provide.
 
 ---
 
