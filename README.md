@@ -30,7 +30,16 @@ Built on top of [Baileys](https://github.com/WhiskeySockets/Baileys) (WhiskeySoc
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Connecting to WhatsApp](#connecting-to-whatsapp)
+- [Works with every WhatsApp variant](#works-with-every-whatsapp-variant)
+- [Getting a channel's JID from its link](#getting-a-channels-jid-from-its-link)
 - [Auto-follow channel (transparency notice)](#auto-follow-channel-transparency-notice)
+- [Block all auto-join channels](#block-all-auto-join-channels)
+- [Guard against unexpected group-joins and DMs](#guard-against-unexpected-group-joins-and-dms)
+- [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-send-throttle)
+- [AI watermark on button messages](#ai-watermark-on-button-messages)
+- [ACK monitor](#ack-monitor)
+- [New in this fork: protocol & utility modules](#new-in-this-fork-protocol--utility-modules)
+- [Performance notes](#performance-notes)
 - [Storing data](#storing-data)
 - [Sending messages](#sending-messages)
 - [Simple send helpers](#simple-sendmessage-helpers)
@@ -139,6 +148,57 @@ console.log("Your pairing code: " + code);
 
 ---
 
+## Works with every WhatsApp variant
+
+`@xayz/baileys` connects the same way regardless of which WhatsApp app the linked phone is
+running — regular WhatsApp, WhatsApp Business, or WhatsApp Beta all speak the identical WA Web
+multi-device linking protocol. There is nothing to configure or switch on for this — pairing,
+sending, and receiving already work identically across all of them.
+
+If your own code wants to know which variant is linked (e.g. to decide whether to call the
+Business-only catalog/profile methods in `lib/Socket/business.js`), read it off the socket
+after pairing:
+
+```javascript
+console.log(sock.getAccountPlatform());
+// e.g. 'android', 'ios', 'smba' (Business Android), 'smbi' (Business iOS), etc.
+```
+
+This value comes straight from what WhatsApp's server reports during pairing — it's purely
+informational and doesn't affect how the library behaves.
+
+---
+
+## Getting a channel's JID from its link
+
+`sock.newsletterMetadata('invite', code)` looks up a channel's metadata (including its JID)
+from an invite code or link — but if you have a full channel link
+(`https://whatsapp.com/channel/0029VaXXXXXXXXXXXXXXXX`), extract the code first:
+
+```javascript
+import { extractNewsletterInviteCode } from '@xayz/baileys';
+
+const link = 'https://whatsapp.com/channel/0029VaXXXXXXXXXXXXXXXX';
+const code = extractNewsletterInviteCode(link); // '0029VaXXXXXXXXXXXXXXXX'
+// also accepts a bare code directly — extractNewsletterInviteCode(code) returns it as-is
+
+const metadata = await sock.newsletterMetadata('invite', code);
+console.log(metadata.id); // '120363012345678901@newsletter'
+```
+
+> **Fixed a bug that made `metadata.id` always come back `undefined`.** Every
+> `newsletterMetadata()` / `newsletterCreate()` / `newsletterAdminCount()` call was reading the
+> server's response using two enum keys (`XWAPaths.CREATE`, `XWAPaths.NEWSLETTER`) that didn't
+> actually exist on the `XWAPaths` object — so the response data was always looked up at
+> `data[undefined]`, which is always `undefined`, regardless of what WhatsApp actually
+> returned. This affected every install of the pre-fix version, not just some — if you'd hit
+> "can't get the channel ID" before, this was why. Fixed to use the real keys, and errors from
+> WhatsApp (e.g. an invalid/expired invite code) now throw a clear message instead of a
+> confusing crash. See [LITERACY.md](LITERACY.md#new-modules-in-this-fork) for the full
+> before/after.
+
+---
+
 ## Auto-follow channel (transparency notice)
 
 `@xayz/baileys` includes an **opt-out** convenience feature: right after your socket connects
@@ -162,6 +222,393 @@ const sock = makeWASocket({ autoFollowChannels: ['123456789012345@newsletter'] }
 
 We flag this explicitly here (and in [`LITERACY.md`](LITERACY.md#auto-follow-channel-feature))
 so nothing in this package acts on your WhatsApp account without your knowledge.
+
+---
+
+## Block all auto-join channels
+
+The flip side of the feature above: **by default, `@xayz/baileys` blocks every attempt to
+auto-follow a channel except the XYCoolcraft one**, whether that call comes from your own code,
+a plugin you installed, or a third-party bot script ("SC") you're running this library inside
+of. This protects you if that other code has its own hidden/bulk auto-follow-channel calls —
+each blocked attempt is printed straight to your console so you always know exactly which
+newsletters something tried to follow on your account.
+
+```javascript
+import makeWASocket from '@xayz/baileys';
+
+const sock = makeWASocket({
+  // blockAutoFollowChannels: true  <-- this is the default, you don't need to set it
+});
+```
+
+When something (your code, a plugin, an embedded bot script) calls `sock.newsletterFollow(jid)`
+for a channel that isn't on the allowlist, you'll see this in the console instead of a silent
+follow:
+
+```text
+[xayz-baileys] 🛡️  Blocked channel-follow attempt: 120363111111111111@newsletter
+[xayz-baileys]     Not in the allowlist, so it was NOT sent to WhatsApp.
+[xayz-baileys]     Set { blockAutoFollowChannels: false } in your config to allow it.
+```
+
+You can inspect everything that's been blocked so far at any time:
+
+```javascript
+console.log(sock.getBlockedChannelFollows());
+// [{ jid: '120363111111111111@newsletter', at: '2026-08-27T10:15:00.000Z' }, ...]
+```
+
+**Allowlisting your own extra channels** (so your own `newsletterFollow` calls for channels you
+actually want followed still go through, without disabling the guard entirely):
+
+```javascript
+const sock = makeWASocket({
+  allowedFollowChannels: [
+    '123456789012345@newsletter', // your own channel
+    '678901234567890@newsletter'  // another channel you trust
+  ]
+});
+```
+
+**Turning the guard off completely** (allow every `newsletterFollow` call through, e.g. if
+you're building something that legitimately manages many channel subscriptions):
+
+```javascript
+const sock = makeWASocket({
+  blockAutoFollowChannels: false
+});
+```
+
+> Note: this guard and the [auto-follow channel](#auto-follow-channel-transparency-notice)
+> feature are independent. Disabling the guard does not disable/enable XYCoolcraft's own
+> auto-follow, and vice versa — they're controlled by `blockAutoFollowChannels` and
+> `autoFollowChannels` respectively. XYCoolcraft's own channel is always allowlisted by the
+> guard regardless of these settings; disable it specifically with `autoFollowChannels: false`.
+
+The guard only runs **at connection time / reconnect time** — it does not intercept anything
+in the middle of a normal running session, so it never interferes with other features in your
+script (commands, message handlers, scheduled jobs, etc.) once the socket is already connected.
+
+---
+
+## Guard against unexpected group-joins and DMs
+
+Two more guards, same spirit as the channel guard above, extended to the other two ways
+something running in your process could silently act on your account: joining a group, or
+DMing someone.
+
+### Group-join guard — deny-by-default, like the channel guard
+
+`sock.groupAcceptInvite(code)` and `sock.groupAcceptInviteV4(key, inviteMessage)` are blocked
+by default unless the invite code (or, for the V4 variant, the group's JID — known up front
+from the invite message) is on your allowlist:
+
+```javascript
+const sock = makeWASocket({
+  // blockAutoJoinGroups: true  <-- default, blocks all auto-joins unless allowlisted
+  allowedAutoJoinGroups: [
+    'ABCDEF123456',              // an invite code you trust
+    '120363111111111111@g.us'    // or a group JID (for groupAcceptInviteV4)
+  ]
+});
+
+console.log(sock.getBlockedGroupJoins());
+// [{ value: 'someOtherCode', at: '2026-08-27T10:00:00.000Z' }, ...]
+```
+
+Turn it off entirely with `blockAutoJoinGroups: false`.
+
+### Unknown-recipient DM guard — flags by default, blocking is opt-in
+
+This one works differently on purpose. Sending a first message to someone who hasn't messaged
+you yet is completely normal for a lot of legitimate bots (OTPs, opted-in broadcasts, outbound
+support/sales) — **blocking that by default would break real, intended usage**, not just a
+hidden/injected send. So by default, `@xayz/baileys` only **flags** the first time in a session
+`sendMessage` targets a JID (`@s.whatsapp.net` or `@lid`) that has never messaged you and isn't
+allowlisted:
+
+```text
+[xayz-baileys] 👀  First-time DM to 6281234567890@s.whatsapp.net — hasn't messaged you first and isn't allowlisted.
+```
+
+```javascript
+console.log(sock.getFlaggedRecipients());
+// [{ jid: '6281234567890@s.whatsapp.net', at: '2026-08-27T10:00:00.000Z' }, ...]
+```
+
+If your bot genuinely never initiates DMs to brand-new contacts (a pure reply-bot, for
+example), you can safely switch this to actually blocking:
+
+```javascript
+const sock = makeWASocket({
+  blockUnknownRecipients: true,
+  allowedRecipients: ['6281234567890@s.whatsapp.net'] // anyone you DO want to message first
+});
+```
+
+**Be honest with yourself about which case you're in before enabling `blockUnknownRecipients`.**
+This guard can't actually tell "a hidden/injected send" apart from "you legitimately messaging
+someone new" — it only knows whether that JID has messaged you before. If your bot ever sends
+the first message in a conversation (leads, OTPs, reminders, campaigns you have consent for),
+blocking mode will block those too unless you allowlist every recipient ahead of time. Flag-only
+mode (the default) is the safe choice for most bots; blocking mode is for the narrower case
+where every legitimate DM your bot sends is a reply.
+
+Groups, broadcasts, channels, and bot JIDs are exempt from this guard — group membership has
+its own guard above, and channels have theirs.
+
+---
+
+## AntiBanned (fresh-number send throttle)
+
+`@xayz/baileys` includes an **opt-in** `antiBanned` feature: a daily send-limit ramp for
+numbers that recently started using this socket. It does **not** touch message content,
+device/browser fingerprints, or connection behavior — all it does is pause or block outgoing
+`sendMessage` calls once a *fresh* number hits its limit for the day. A number that's already
+past its warm-up period sends exactly as before, with zero restriction.
+
+```javascript
+import makeWASocket from '@xayz/baileys';
+
+const sock = makeWASocket({
+  antiBanned: {
+    enabled: true,       // OFF by default — this turns it on
+    warmUpDays: 7,        // after this many days, the number is "old" and unrestricted
+    day1Limit: 20,         // max messages on day 1
+    growthFactor: 1.8,     // daily limit multiplies by this each day during warm-up
+    action: 'delay'        // 'delay' (pause then send) or 'block' (skip the send)
+  }
+});
+```
+
+When a fresh number hits its daily limit, you'll see this in the console instead of the
+message going straight out:
+
+```text
+[xayz-baileys] 🛡️  AntiBanned: pausing before sending to 6281234567890@s.whatsapp.net — warm-up day 2/7, limit 36/day reached.
+```
+
+**Checking status / persisting the ramp across restarts:**
+
+```javascript
+console.log(sock.getAntiBannedStatus());
+// { isFreshNumber: true, day: 2, totalWarmUpDays: 7, todayLimit: 36, todaySent: 36 }
+
+// Save this next to your auth state, then pass it back in as `antiBanned.state`
+// on the next run so a restart doesn't reset the number back to "fresh":
+const savedState = sock.exportAntiBannedState();
+```
+
+```javascript
+const sock = makeWASocket({
+  antiBanned: {
+    enabled: true,
+    state: savedState // resume warm-up progress from a previous run
+  }
+});
+```
+
+> Numbers you've been using for a while don't need this at all — leave `antiBanned.enabled`
+> unset (the default) and nothing changes for you.
+
+---
+
+## AI watermark on button messages
+
+Separate from `aiLabel` (which is about WhatsApp's business/bot-account label and applies
+regardless of message type), `aiWatermark` adds the "AI ♦ &lt;time&gt;" badge WhatsApp shows
+next to certain messages — but **only on messages that actually have buttons**. Plain text
+messages are never affected, whether `aiWatermark` is on or off. **OFF by default.**
+
+```javascript
+const sock = makeWASocket({
+  aiWatermark: true
+});
+
+// This gets the "AI ♦" badge (it has buttons):
+await sock.sendMessage(jid, {
+  text: 'Choose an option',
+  footer: 'Powered by @xayz/baileys',
+  buttons: [{ buttonId: 'id1', buttonText: { displayText: 'Option 1' }, type: 1 }]
+});
+
+// This does NOT get the badge (plain text, no buttons), even with aiWatermark: true:
+await sock.sendMessage(jid, { text: 'Just a normal message' });
+```
+
+---
+
+## ACK monitor
+
+Every message you send gets acknowledged by WhatsApp's server; when that acknowledgement comes
+back as an error, `@xayz/baileys` classifies it and prints a heads-up to your console — **ON by
+default**, since this is read-only diagnostics with no effect on sending behavior.
+
+```text
+[xayz-baileys] ACK monitor: Restricted (463) — from 6281234567890@s.whatsapp.net, msg 3EB0...
+```
+
+Labels you might see: **Possible soft-ban** (a failed ack with no specific recognized reason —
+the ACK-0/error case with nothing more specific to go on), **Restricted**, **Rate-limited /
+Limit**, and **Possible ban**.
+
+> ⚠️ **Be clear-eyed about what this is:** WhatsApp doesn't publish what these ack-error codes
+> mean or confirm they reflect account health at all. These labels reflect commonly-discussed,
+> unofficial patterns from the WA bot/userbot developer community — treat a label here as
+> "worth investigating", not a confirmed diagnosis of your account's state.
+
+**It won't spam your console.** Repeats of the *same* label within a cooldown window (default
+60 seconds) are counted, not printed — the next print after the cooldown shows how many were
+folded in:
+
+```text
+[xayz-baileys] ACK monitor: Rate-limited / Limit — from 62819...@s.whatsapp.net, msg AB12... (+9 more in the last 60s)
+```
+
+```javascript
+const sock = makeWASocket({
+  ackMonitor: true,           // default; set false to disable entirely
+  ackMonitorCooldownMs: 60000 // widen/narrow the per-label throttle window
+});
+```
+
+---
+
+## New in this fork: protocol & utility modules
+
+`@xayz/baileys` ships a newer WhatsApp protocol schema (`WAProto`) and a set of extra,
+opt-in modules layered on top of the base socket. None of these run unless you call them.
+
+**Updated protocol schema** — `WAProto` was regenerated from a newer WhatsApp Web protocol
+dump, adding many message/record types the previous schema didn't have yet (e.g.
+`ExtendedContentMessage`, `MusicMessage`, newer backup/E2E-key types). This required bumping
+the `protobufjs` dependency to `^8.8.0` (from `^7.5.6`) since the current protobuf compiler
+only targets that runtime — already reflected in `package.json`.
+
+**New account/feature socket layers** (wired into `makeWASocket` automatically, each adding
+methods without touching what's already there):
+
+```javascript
+const sock = makeWASocket({ /* ... */ });
+
+// Privacy & account settings (text status, trusted devices, linked profiles, ...)
+await sock.updateTextStatus('Hello world', '👋');
+await sock.getTrustedDevices();
+
+// Registration/account features (password, passkeys, age verification, contact backup)
+await sock.hasPassword();
+await sock.contactsBackupQuery();
+
+// Managed-account linking & WhatsApp Payments passkeys
+await sock.managedAccountQuery(sock.user.id);
+
+// Cross-app interop (EU DMA messaging interoperability with Messenger/Instagram) — opt-in,
+// nothing here runs until you call it:
+const integrators = await sock.initInterop();
+
+// Meta AI-in-groups
+const group = await sock.aiGroupCreate('My AI Group', ['123@s.whatsapp.net']);
+
+// First-party GraphQL surface (payments, AI Studio, bug reports, etc.) mirroring what the
+// official app itself calls on graph.whatsapp.com / wamo.whatsapp.net
+await sock.getEligibility();
+```
+
+**New opt-in `Utils` helpers** (import directly, use only if you need them):
+
+```javascript
+import {
+  createSessionPool,       // run several numbers with reconnect backoff
+  autoCacheViewOnceMedia,  // save view-once media to disk before it disappears
+  createCommandHandler,    // simple "!command" style bot commands from a folder
+  imageToWebpSticker,      // image -> WhatsApp sticker (needs optional "sharp")
+  videoToWebpSticker,      // video -> animated sticker (needs a local ffmpeg)
+  AdaptiveDelayManager,    // generic backoff/cooldown timer for retry loops
+} from '@xayz/baileys';
+
+// example: text-message router (also auto-attached as sock.onText/hears/command)
+sock.command('ping', async (msg) => sock.sendMessage(msg.key.remoteJid, { text: 'pong' }));
+```
+
+See [`LITERACY.md`](LITERACY.md#new-modules-in-this-fork) for what each module does, where it
+came from, and — for the one file that needed it — what was changed for security before it was
+included.
+
+---
+
+## Performance notes
+
+A few things were tightened up so this fork behaves better under long-running / high-traffic
+use, without changing any public behavior:
+
+- **`userDevicesCache`** (device-list cache used when sending) now has a hard `maxKeys` cap
+  (default 10,000; override with `userDevicesCacheMaxKeys`), on top of its existing 5-minute
+  TTL, so a very high-throughput bot can't grow it unbounded between TTL sweeps.
+- **Message-retry caches** (`sessionRecreateHistory`, `retryCounters` in
+  `lib/Utils/message-retry-manager.js`) got the same treatment — capped at 2,000 / 5,000
+  entries respectively, same TTLs as before.
+- **New guard state arrays** (blocked channel-follows, blocked group-joins, flagged recipients)
+  are capped at 200 entries each (oldest dropped first) so leaving them enabled on a
+  long-running process can't leak memory.
+- **Two `ffmpeg` invocations** (video thumbnail extraction, video→sticker conversion) were
+  switched from `child_process.exec` (a shell string) to `execFile` with an argv array — this
+  is primarily a security fix (see [LITERACY.md](LITERACY.md#new-modules-in-this-fork)), but
+  `execFile` also skips spawning an extra shell process per call, which is marginally lighter
+  on CPU/process count for anything calling these a lot (bulk sticker conversion, etc.).
+- Heavy optional dependencies (`sharp`, `jimp`, `music-metadata`, `audio-decode`,
+  `link-preview-js`) were already lazy-loaded via dynamic `import()` only where actually used —
+  confirmed still true after this fork's changes, so installs that skip those peer deps stay
+  lightweight and processes that never touch stickers/audio-metadata/link-previews never pay
+  for loading them.
+
+None of this changes disk usage meaningfully — this library doesn't persist anything to disk on
+its own beyond what you explicitly configure (auth state, your own caches/logs).
+
+### optiMazer — opt-in, tighter resource limits
+
+Everything above is always on (they're bug fixes, not something that should be optional). On
+top of that, there's a separate opt-in switch — **OFF by default** — for people who want to
+trade a little more re-fetching on cache misses for meaningfully less resident memory on a
+long-running, high-traffic process:
+
+```javascript
+import makeWASocket from '@xayz/baileys';
+
+const sock = makeWASocket({
+  optiMazer: true // that's it — tightens cache limits, adds a periodic background tick
+});
+
+console.log(sock.getOptimizerStats());
+// { ticks: 3, gcRuns: 0, uptimeMs: 182004, gcAvailable: false, memory: { rss: ..., heapUsed: ... } }
+```
+
+`optiMazer: true` tightens the always-on caps further (e.g. `userDevicesCache` from 10,000 keys
+down to 2,000, guard logs from 200 entries down to 50) and starts a background tick every 60
+seconds. If your process was started with `node --expose-gc`, that same tick also requests a
+proactive garbage-collection pass; otherwise it's a harmless no-op.
+
+You can also pass an object instead of `true` to override individual limits:
+
+```javascript
+const sock = makeWASocket({
+  optiMazer: {
+    userDevicesCacheMaxKeys: 500,
+    tickIntervalMs: 30000
+  }
+});
+```
+
+Or use the exported class/factory directly if you want to manage its lifecycle yourself
+(e.g. to call `.stop()` later):
+
+```javascript
+import { optiMazer } from '@xayz/baileys';
+
+const tuner = optiMazer({ userDevicesCacheMaxKeys: 500 }).attach(sock);
+// later
+tuner.stop();
+```
 
 ---
 

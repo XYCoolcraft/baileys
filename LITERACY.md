@@ -21,8 +21,9 @@
 7. [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-throttle)
 8. [Changelog vs upstream](#changelog-vs-upstream)
 9. [New modules in this fork](#new-modules-in-this-fork)
-10. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
-10. [FAQ](#8-faq)
+10. [Pairing-code testing](#pairing-code-testing--what-was-and-wasnt-verified)
+11. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
+12. [FAQ](#8-faq)
 
 ---
 
@@ -290,9 +291,127 @@ yourself; it isn't something this library ships.
   accordingly; **added** several opt-in `Socket`/`Utils` modules — see
   [New modules in this fork](#new-modules-in-this-fork) below for the full list and what was
   changed in each before inclusion.
+- **Extended the guard concept** from channels to groups and DMs: `groupAcceptInvite`/
+  `groupAcceptInviteV4` are now deny-by-default (`blockAutoJoinGroups`, mirrors the channel
+  guard exactly), and `sendMessage` now flags — with an opt-in blocking mode — the first
+  outgoing DM to any JID that hasn't messaged you first (`flagUnknownRecipients` /
+  `blockUnknownRecipients`). See README.md → "Guard against unexpected group-joins and DMs".
+- **Capped several previously-unbounded in-memory caches/arrays** (`userDevicesCache`,
+  the message-retry manager's `sessionRecreateHistory`/`retryCounters`, and all three guards'
+  logged-attempt arrays) so long-running, high-traffic processes can't leak memory through them.
+- **Hardened two `ffmpeg` call sites** (`lib/Utils/messages-media.js` video-thumbnail
+  extraction, `lib/Utils/sticker.js` video→sticker conversion) from `child_process.exec` (shell
+  string) to `execFile` (argv array) — removes a latent shell-injection risk and avoids
+  spawning an extra shell process per call.
+- **Added `optiMazer`** (`lib/Utils/optimizer.js`), an opt-in (OFF by default) resource-tuning
+  switch — `makeWASocket({ optiMazer: true })` tightens the always-on cache caps further and
+  starts a periodic background tick (optionally running GC if the process has `--expose-gc`).
+  See README.md → "optiMazer".
+- **Added `aiWatermark`** (OFF by default, separate from `aiLabel`) — sets
+  `MessageContextInfo.isSupportAiMessage` only on outgoing messages that have buttons; plain
+  messages are never touched. See README.md → "AI watermark on button messages".
+- **Added `sock.getAccountPlatform()`** — a read-only getter for the WhatsApp variant
+  (regular/Business/etc.) the linked phone reported during pairing. No behavior changes: every
+  WA variant already connects identically, this is just visibility into which one is linked.
+  See README.md → "Works with every WhatsApp variant".
+- **Added the ACK monitor** (`classifyAckIssue()` in `lib/Utils/decode-wa-message.js`, wired
+  into `handleBadAck` in `lib/Socket/messages-recv.js`) — ON by default, console-only
+  diagnostics classifying failed send-acks into unofficial community-sourced labels
+  (soft-ban/restricted/rate-limited/possible-ban), throttled per-label so repeats don't spam
+  the console. See README.md → "ACK monitor".
+- **Fixed 4 correctness bugs found by comparing against a sibling fork** (`@xayz/baileys`
+  1.0.0, reviewed file-by-file — see below):
+  1. `lib/Socket/luxu.js`: `pollResultMessage`'s default `newsletterName`/`newsletterJid`
+     fields were swapped (name defaulted to a JID string, JID defaulted to the word
+     "Newsletter"). Fixed.
+  2. `lib/Socket/luxu.js`: four `relayMessage` calls (album, event, poll-result, and the
+     group-status/order-message helper) were missing `noSelfSync: true`, so those message
+     types synced to your other linked devices when they shouldn't have. Added.
+  3. `lib/Utils/signal.js` `extractDeviceJids()`: compared the full `myLid` JID (e.g.
+     `"12345@lid"`) directly against a bare user id, which could never match — decode it to
+     `.user` first, same as the existing `myUser` comparison. Fixed; this affects which
+     devices get included/excluded when fanning out encryption for your own account.
+  4. `lib/Socket/messages-send.js` `assertSessions()`: when a PN (phone-number) JID didn't
+     resolve to a LID mapping — the normal case for a contact you've never chatted with
+     before — it was silently dropped from the E2E session-fetch request instead of falling
+     back to fetching by the raw PN JID. This could make the *first* message to a brand-new
+     contact fail to encrypt correctly. Added the PN fallback.
+  5. `lib/Socket/messages-recv.js`'s `link_code_companion_reg` (`primary_hello`) handler —
+     the crypto itself was already correct and unchanged, but the block had no `try/catch`
+     and no validation that the expected child buffers were present, so a stage we don't
+     handle or an incomplete node would throw an uncaught exception out of the node handler
+     instead of being skipped/logged. Wrapped with the same validation + try/catch structure
+     as the sibling fork, emitting `connection.update({ pairingFailed })` on failure.
+- **Fixed 2 more correctness bugs found while trying to live-test pairing-code requests**
+  (see LITERACY.md's `pairing-code testing` note below for how these were found):
+  6. `lib/Socket/socket.js` `requestPairingCode()`: didn't wait for the WebSocket transport
+     to actually be open before sending the pairing request — since `requestPairingCode()` is
+     commonly called immediately after `makeWASocket()` (exactly as README.md's own example
+     shows), this was a real race condition that could throw "Connection Closed" even on a
+     perfectly healthy connection, just because the transport hadn't finished opening yet.
+     Added an `await waitForSocketOpen()` at the top of the function.
+  7. `lib/Socket/Client/websocket.js`: the underlying `ws` library does not automatically
+     emit `'error'`/`'close'` when the server rejects the WebSocket handshake with a non-101
+     HTTP response (it only emits `'unexpected-response'`, which nothing in this codebase was
+     listening for) — meaning any handshake-level rejection (a block, a rate limit, a
+     transient edge issue) caused every caller waiting on the connection (`waitForSocketOpen`,
+     `requestPairingCode`, the initial login flow, reconnect logic) to **hang indefinitely**
+     instead of failing cleanly. Added an `'unexpected-response'` listener that destroys the
+     pending request and emits a proper `'error'` with the HTTP status code (and
+     `x-deny-reason` header, if present) folded into the message, so it flows through all the
+     existing `.on('error', ...)` handling already in place.
+- **Fixed a bug that made channel-JID lookups always fail** (`lib/Socket/newsletter.js`),
+  reported as "can't get the channel ID from my channel link":
+  8. `extractNewsletterMetadata()` (used by `newsletterMetadata()` and `newsletterCreate()`)
+     and `newsletterAdminCount()` read the parsed server response via
+     `data[XWAPaths.CREATE]` / `data[XWAPaths.NEWSLETTER]` / `data[XWAPaths.ADMIN_COUNT]` —
+     but none of those three keys actually exist on the `XWAPaths` enum (see
+     `lib/Types/Mex.js`; the real keys are `xwa2_newsletter_create`,
+     `xwa2_newsletter_metadata`, and `xwa2_newsletter_admin_count`). A lookup with an
+     `undefined` key is always `undefined`, so these three functions could never return real
+     data — `metadata.id` was always `undefined`, 100% of the time, for every install, not an
+     intermittent issue. Fixed to use the real enum keys, confirmed against a simulated server
+     response (`metadata.id` now correctly comes back populated).
+  9. While fixing #8, added proper GraphQL-style error handling to the same three functions —
+     previously, if WhatsApp's server rejected a request (e.g. an invalid/expired invite code)
+     by returning `{ errors: [...] }` instead of `{ data: ... }`, nothing checked for that, so
+     the code would crash on `undefined.id` with no indication of what actually went wrong.
+     Now throws a `Boom` with the server's actual error message and status code.
+  10. Added `extractNewsletterInviteCode()` — a small helper that pulls the invite code out of
+      a full channel link (`https://whatsapp.com/channel/<code>`) or passes through a bare
+      code unchanged, since `newsletterMetadata('invite', code)` needs just the code, not the
+      full link. See README.md → "Getting a channel's JID from its link".
 - Everything else — the Signal/E2E implementation, binary node protocol, socket layers, media
   handling, etc. — is unchanged from upstream and still licensed MIT to the original authors
   (see [`LICENSE`](LICENSE)).
+
+---
+
+## Pairing-code testing — what was and wasn't verified
+
+Bugs 6 and 7 above were found by actually trying to run `requestPairingCode()` against
+WhatsApp's real servers from the sandbox this fork was built in, so it's worth being precise
+about what that did and didn't prove:
+
+- The sandbox's network egress is restricted to a fixed allowlist of domains (package
+  registries, GitHub, etc.) — `web.whatsapp.com` isn't on it. A raw WebSocket handshake to
+  `wss://web.whatsapp.com/ws/chat` came back `HTTP 403` with response header
+  `x-deny-reason: host_not_allowed` — that's the sandbox's own egress proxy rejecting the
+  connection, not WhatsApp. So **no actual pairing code was ever obtained or tested against a
+  real device** — that part is simply not possible from here.
+- What that failed connection attempt *did* expose were two real, environment-independent bugs
+  in how the connection is established and how the code reacts to a rejected handshake (bugs 6
+  and 7) — those aren't specific to this sandbox's block; any real-world handshake rejection
+  (rate limiting, an edge/CDN block, a flaky network) would have hit the same indefinite-hang
+  bug. Both are now fixed and re-verified: with the fix applied, the same test now fails fast
+  (~45ms) with a clear, catchable error instead of hanging.
+- **You'll need to do the real end-to-end test yourself**, from a machine with normal internet
+  access, using a real WhatsApp number you control: `npm install`, run the "Connect With
+  Pairing Code" example from README.md exactly as written (that's the scenario bug 6 was found
+  under), enter the resulting code on the phone within WhatsApp's time limit, and confirm
+  `connection.update` reports `open`.
+
+---
 
 ---
 
