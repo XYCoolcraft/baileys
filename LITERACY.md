@@ -19,11 +19,12 @@
 5. [Auto-follow channel feature](#auto-follow-channel-feature)
 6. [Channel-follow guard](#channel-follow-guard-block-all-auto-join-channels)
 7. [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-throttle)
-8. [Changelog vs upstream](#changelog-vs-upstream)
-9. [New modules in this fork](#new-modules-in-this-fork)
-10. [Pairing-code testing](#pairing-code-testing--what-was-and-wasnt-verified)
-11. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
-12. [FAQ](#8-faq)
+8. [AntiBan (full send-safety suite)](#antiban-full-send-safety-suite)
+9. [Changelog vs upstream](#changelog-vs-upstream)
+10. [New modules in this fork](#new-modules-in-this-fork)
+11. [Pairing-code testing](#pairing-code-testing--what-was-and-wasnt-verified)
+12. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
+13. [FAQ](#8-faq)
 
 ---
 
@@ -123,6 +124,7 @@ files.
 | `lib/Utils/` | Everything that doesn't need its own socket layer: media encrypt/decrypt/upload, message generation helpers, crypto helpers, logger, mutex, browser fingerprint presets, etc. |
 | `lib/Store/` | Optional in-memory store (`makeInMemoryStore`) that mirrors chats/contacts/messages by listening to `sock.ev`. |
 | `lib/Defaults/` | Default connection config (`DEFAULT_CONNECTION_CONFIG`), cache TTLs, media path maps, and `DEFAULT_AUTO_FOLLOW_CHANNELS`. |
+| `lib/antiban.js` | The [`AntiBan` full send-safety suite](#antiban-full-send-safety-suite) — rate limiting, warm-up, health scoring, and several opt-in guards. Self-contained; wired into every socket via `wrapSocket()` in `lib/Socket/index.js`. |
 
 ---
 
@@ -269,6 +271,141 @@ yourself; it isn't something this library ships.
 
 ---
 
+## AntiBan (full send-safety suite)
+
+**Where:** [`lib/antiban.js`](lib/antiban.js) — one self-contained file (no dependencies on
+any other `lib/` module), wired in with a single call in `lib/Socket/index.js`:
+
+```javascript
+// lib/Socket/index.js
+import { wrapSocket } from '../antiban.js';
+// ...after every other socket layer is composed (communities, AI groups, privacy,
+// registration, managed-account, interop, GraphQL), and before attachTextRouter:
+if (newConfig.antiban !== false) {
+    sock = wrapSocket(sock, newConfig.antiban || 'aggressive');
+}
+```
+
+**Config default:** `lib/Socket/index.js` → `'aggressive'` preset, applied unconditionally
+unless `config.antiban === false`. Unlike `antiBanned` above, this one is **on by default** —
+the fork's position is that basic send-safety shouldn't require opt-in wiring.
+
+The `## AntiBanned` section above says content variation, fingerprint spoofing, proxy rotation,
+and human-timing simulation are "deliberately out of scope" for that module — **this is where
+those actually live.** `AntiBan` is the broader suite; `AntiBanned`'s fresh-number ramp is one
+narrow piece of what `AntiBan`'s own `WarmUp` sub-module also does, kept as a separate smaller
+module for people who want just that one thing without pulling in the rest.
+
+### How `wrapSocket()` attaches to the socket
+
+```javascript
+// lib/antiban.js (simplified)
+function wrapSocket(sock, config, warmUpState, wrapOptions) {
+  const antiban = new AntiBan(config, warmUpState);
+
+  // 1. Listen for events the rest of AntiBan needs to reason about:
+  sock.ev.process(async (events) => {
+    if (events['connection.update']) { /* feeds health.onDisconnect/onReconnect, timelock */ }
+    if (events['messages.update'])    { /* feeds retryTracker (error code 463 detection) */ }
+    if (events['messages.upsert'])    { /* feeds contactGraph/timelock "known chat" tracking */ }
+  });
+
+  // 2. Wrap sendMessage so every outgoing message passes through beforeSend()/afterSend():
+  const originalSendMessage = sock.sendMessage.bind(sock);
+  const wrapped = Object.create(sock);
+  wrapped.sendMessage = async (jid, content, options) => {
+    const decision = await antiban.beforeSend(jid, content?.text ?? '');
+    if (!decision.allowed) throw new Error(`[baileys-antiban] Message blocked: ${decision.reason}`);
+    if (decision.delayMs > 0) await sleep(decision.delayMs);
+    const result = await originalSendMessage(jid, content, options);
+    antiban.afterSend(jid, content?.text ?? '');
+    return result;
+  };
+  wrapped.antiban = antiban; // <- this is what you see as sock.antiban
+  return wrapped;
+}
+```
+
+`sock.ev.process` (a single batched handler) is used when the underlying socket supports it;
+`wrapSocket` falls back to individual `sock.ev.on(...)` listeners otherwise — same event
+coverage either way, just a different Baileys internal API for subscribing to it.
+
+### The `AntiBan` orchestrator class
+
+`new AntiBan(config, warmUpState)` builds and owns one instance of each sub-module below.
+Everything except `rateLimiter`, `warmUp`, and `health` is opt-in — off unless you pass config
+for it — because they need more setup/assumptions about your traffic pattern to be safe
+defaults for everyone:
+
+| Sub-module | Enabled by default? | What it tracks |
+| --- | --- | --- |
+| `RateLimiter` (`.rateLimiter`) | ✅ | Sliding per-minute/hour/day send counters; picks a randomized human-like delay between `minDelayMs`–`maxDelayMs`; a longer `newChatDelayMs` the first time you message a given JID. |
+| `WarmUp` (`.warmUp`) | ✅ | Same fresh-number daily ramp idea as `AntiBanned`, integrated so it also feeds the shared `health` score. |
+| `HealthMonitor` (`.health`) | ✅ | Rolls disconnects, failed sends, and forbidden/timelock errors into a `low`/`medium`/`high`/`critical` score; can auto-pause sending at a configurable threshold (`autoPauseAt`). |
+| `TimelockGuard` (`.timelock`) | ✅ | Detects WhatsApp's "reachout timelock" (new-contact messaging restriction, error 463) and blocks new-contact sends until it lifts. |
+| `ReplyRatioGuard` (`.replyRatio`) | opt-in | Flags/blocks when your outbound-to-inbound message ratio to a contact looks one-sided (spam-shaped) rather than a real conversation. |
+| `ContactGraphWarmer` (`.contactGraph`) | opt-in | Paces how fast you message *new* contacts you haven't talked to before, independent of overall rate limits. |
+| `PresenceChoreographer` (`.presence`) | opt-in | Coordinates `composing`/`available` presence updates around sends so they look like a person typing, not a bot firing instantly. |
+| `RetryReasonTracker` (`.retryTracker`) | ✅ | Watches `messages.update` for messages stuck retrying and classifies *why* (session desync, delivery failure, etc.); calls `onSpiral` if one message keeps failing. |
+| `PostReconnectThrottle` (`.reconnectThrottle`) | opt-in | Temporarily lowers the effective send rate right after a reconnect, ramping back up to normal instead of resuming at full speed immediately. |
+| `JidCanonicalizer` / `LidResolver` (`.jidCanonicalizer` / `.lidResolver`) | opt-in | Maps between phone-number JIDs and WhatsApp's newer LID (linked-ID) form so rate-limit/warm-up state is tracked per real contact, not fragmented across two JIDs for the same person. |
+| `SessionHealthMonitor` (`.sessionStability`) | opt-in | Watches Signal-session MAC-verification failure rate; flags degraded/recovered sessions. |
+| `StateManager` | opt-in (`config.persist`) | Debounced JSON-file persistence of rate-limiter/warm-up state, so a process restart doesn't reset a number back to "fresh". |
+
+`beforeSend()` runs these checks **in order** — health pause, then timelock, then warm-up, then
+contact-graph, then reply-ratio, then reconnect-throttle — and returns on the first one that
+blocks, so `decision.reason` always tells you exactly which guard stopped the send. If every
+check passes, it returns the rate-limiter's computed `delayMs` and the message goes out after
+that delay.
+
+### Config shapes accepted
+
+`resolveConfig()` in `lib/antiban.js` accepts three input shapes, and `wrapSocket`/`AntiBan`
+detect which one you gave it:
+
+1. **Nothing** (`undefined`) → `conservative` preset. (`lib/Socket/index.js` never actually
+   passes `undefined` through, though — it defaults to `'aggressive'` before `wrapSocket` ever
+   sees it, so a bare `makeWASocket({})` gets `aggressive`, not `conservative`.)
+2. **A preset name string** (`'conservative' | 'moderate' | 'aggressive'`).
+3. **A flat object** — `{ preset: 'moderate', maxPerMinute: 15, ... }` (`preset` optional,
+   defaults to `conservative` inside `resolveConfig` itself if omitted — but again,
+   `lib/Socket/index.js`'s own `|| 'aggressive'` fallback means this only matters if you pass
+   an object without a `preset` key explicitly).
+4. **A legacy nested object** — `{ rateLimiter: {...}, warmUp: {...}, health: {...},
+   replyRatio: {...}, contactGraph: {...}, presence: {...}, retryTracker: {...},
+   reconnectThrottle: {...}, jidCanonicalizer: {...}, lidResolver: {...},
+   sessionStability: {...}, persist: '...', logging: true }` — `isLegacyConfig()` detects this
+   shape (looks for any of those known nested keys) and routes it through `mapLegacyToFlat()`
+   for the preset-level fields, while passing the rest straight through to each sub-module's own
+   constructor. This is how you reach the opt-in sub-modules (`replyRatio`, `contactGraph`,
+   etc.) — they only turn on when their own nested config block sets `enabled: true`.
+
+### API surface (`sock.antiban`)
+
+| Member | Signature | Notes |
+| --- | --- | --- |
+| `getStats()` | `() => object` | Full snapshot — send counters, `health`, `warmUp`, `rateLimiter`, plus any enabled optional sub-module's stats. |
+| `stats` | `{ messagesAllowed, messagesBlocked, totalDelayMs }` | Just the raw counters (also included inside `getStats()`). |
+| `resolvedConfig` | `object` | The fully-resolved config actually in effect (preset + your overrides merged). |
+| `pause()` / `resume()` | `() => void` | Manual override on top of the automatic health-based pause. |
+| `reset()` | `() => void` | Resets timelock, health, and warm-up trackers. |
+| `exportWarmUpState()` | `() => object` | Warm-up progress, for your own persistence if you're not using `config.persist`. |
+| `destroy()` | `() => void` | Clears all internal timers (debounce timers, presence timers, etc.) — call this on shutdown. |
+| `.timelock`, `.replyRatio`, `.contactGraph`, `.presence`, `.retryTracker`, `.reconnectThrottle`, `.jidCanonicalizer`, `.lidResolver`, `.sessionStability` | getters | Direct access to each sub-module instance if you need something beyond what `getStats()` surfaces. |
+
+**Verified end-to-end** (not just unit-level): built against a real `makeWASocket()` call from
+this fork — `sock.antiban` is present immediately with the `aggressive` preset resolved
+(`maxPerMinute: 20`), `antiban: false` correctly leaves `sock.antiban` `undefined`, a custom
+preset string (`'conservative'`) correctly changes the resolved limits, and a real
+`sock.sendMessage()` call visibly runs `beforeSend()`'s delay before reaching (and failing at,
+for the unrelated reason of no live WhatsApp session in a test environment) the original
+send path — confirming the wrap sits in front of, not beside, the real send.
+
+**To enable, tune, or disable it**, see
+[README → AntiBan](README.md#antiban-full-send-safety-suite).
+
+---
+
 ## Changelog vs upstream
 
 - **Added** the `antiBanned` fresh-number send throttle (`lib/Utils/warmup.js`, opt-in, OFF by
@@ -320,7 +457,7 @@ yourself; it isn't something this library ships.
   (soft-ban/restricted/rate-limited/possible-ban), throttled per-label so repeats don't spam
   the console. See README.md → "ACK monitor".
 - **Fixed 4 correctness bugs found by comparing against a sibling fork** (`@xayz/baileys`
-  1.0.0, reviewed file-by-file — see below):
+  2.0.0, reviewed file-by-file — see below):
   1. `lib/Socket/luxu.js`: `pollResultMessage`'s default `newsletterName`/`newsletterJid`
      fields were swapped (name defaulted to a JID string, JID defaulted to the word
      "Newsletter"). Fixed.
@@ -384,6 +521,85 @@ yourself; it isn't something this library ships.
 - Everything else — the Signal/E2E implementation, binary node protocol, socket layers, media
   handling, etc. — is unchanged from upstream and still licensed MIT to the original authors
   (see [`LICENSE`](LICENSE)).
+
+---
+
+## Deeper fork comparison — what schema-only diffing missed
+
+A second, more thorough pass compared every `Socket`/`Utils`/`Types`/`WAUSync` file (not just
+`WAProto.proto`) across the same three forks. This found real, functional gaps the earlier
+message-type diff didn't catch, since having a field in the protobuf schema doesn't mean the
+JS code that builds/sends/decrypts that format actually exists yet:
+
+- **Fixed a bug that silently dropped every Meta-AI-bot response.** `lib/Socket/messages-recv.js`
+  had a block literally commented `// TODO: temporary fix for crashes and issues resulting of
+  failed msmsg decryption` that dropped every incoming "msmsg" message (the envelope format
+  used for bot responses, e.g. Meta AI in a chat/group) instead of decrypting it. Added
+  `lib/Utils/meta-ai-msmsg.js` (the actual decrypt logic, ported and — since the crypto
+  library's `hkdf` only accepts string `info` and this needs raw-byte `info`/`aad` — paired
+  with a small self-contained RFC 5869 HKDF-HMAC-SHA256 implementation local to that file) and
+  wired a `case 'msmsg':` into `lib/Utils/decode-wa-message.js`'s decrypt switch, plus a
+  `getMessage`-based secret-recovery fallback in `messages-recv.js` for when the in-memory
+  secret registration was lost to a process restart. **Verified with a real encrypt→decrypt
+  round-trip test** (encrypt a message with the same key-derivation the decrypt path expects,
+  confirm `decryptMsmsgBotMessage` recovers the exact original plaintext) — passed.
+- **Added `sock.sendStatusWhatsApp(content, jids)`** — post a WhatsApp Status (story) and
+  notify specific people/groups that they were mentioned (group JIDs are expanded to member
+  lists). This didn't exist anywhere in the library before. Ported into `lib/Socket/luxu.js`
+  as a new method on the existing `imup` class, with the constructor extended (backward
+  compatibly — existing 3-argument call sites are unaffected) to optionally receive the extra
+  context (`authState`, `groupMetadata`, etc.) this needs. The source this was ported from
+  referenced helper functions (`jidNormalizedUser`, `isJidGroup`, `isPnUser`, `STORIES_JID`)
+  via the wrong namespace (`this.utils.X`, but those are `WABinary` exports, not `Utils`) —
+  fixed to import them directly from `WABinary/index.js`.
+- **Added 5 more `WAUSync` protocols** (`lib/WAUSync/Protocols/`): `USyncBusinessProtocol`
+  (verified business name/profile), `USyncFeatureProtocol` (which encryption/feature flags a
+  JID supports), `USyncPictureProtocol` (profile picture id/path/hash without a separate media
+  fetch), `USyncSidelistProtocol`, and `USyncTextStatusProtocol` (a contact's text "About"
+  status, with `setAt`/`expiresAt`/emoji). Wired into `USyncQuery` as
+  `.withBusinessProtocol()` / `.withFeatureProtocol()` / `.withPictureProtocol()` /
+  `.withSidelistProtocol()` / `.withTextStatusProtocol()`, matching the existing builder
+  pattern. (Two more files, `USyncBotProfileProtocol`/`USyncLIDProtocol`, turned out to just
+  be differently-cased duplicates of protocols already present — confirmed via direct content
+  diff, nothing to add there.)
+- **Expanded `XWAPaths`/`QueryIds` in `lib/Types/Mex.js`** — additive only, no existing key's
+  value was changed. Added newsletter/channel admin, directory search, insights, moderation,
+  and WAMO-subscription related keys that weren't mapped before (directory list/search,
+  admin-invite create/revoke/accept, poll voter list, reaction sender list, user reports,
+  report appeals, link-preview check, and more). Not yet wired into any function — available
+  groundwork for building those admin/directory features on top of, same pattern as the
+  existing `FOLLOW`/`MUTE`/etc. usage.
+- **Added `CurveJS`** (`lib/Utils/crypto.js`, backed by a new `lib/Utils/curve25519-js.js`) —
+  a pure-JavaScript, zero-native/zero-git-dependency fallback for the `Curve` (Curve25519 key
+  exchange + signing) operations the primary implementation needs from `libsignal` (currently
+  a `github:` dependency — see `vendor-libsignal.sh`). Key generation and ECDH delegate to
+  Node's own built-in `crypto.generateKeyPairSync('x25519')`/`crypto.diffieHellman` (low risk,
+  not custom math); signing/verification implement the standard XEdDSA scheme. **Verified**,
+  not just ported: ECDH agreement between two independently generated keypairs matches: sign→
+  verify round-trips correctly; a tampered message and a wrong public key are both correctly
+  rejected; and critically, a shared key computed with the existing `libsignal`-backed `Curve`
+  on one side and `CurveJS` on the other **matches bit-for-bit** — confirming real
+  interoperability, not just internal self-consistency. Not used by default anywhere in the
+  library. See README.md → "Pure-JS Curve25519 fallback".
+- **Added `useSqliteAuthState()`** (`lib/Utils/use-sqlite-auth-state.js`) — an alternative to
+  `useMultiFileAuthState` backed by Node's built-in `node:sqlite` (Node 22.5+) instead of one
+  JSON file per key, which scales much better for a busy bot with lots of prekeys/app-state
+  keys. Throws a clear error suggesting `useMultiFileAuthState` instead if `node:sqlite` isn't
+  available (older Node) — nothing else in the library depends on it. **Tested end-to-end**:
+  wrote a key, read it back, persisted `creds` across closing and reopening the database file.
+  Supports an optional one-time migration from an existing `useMultiFileAuthState` folder via
+  `{ migrateFromFolder }`.
+- **Found and excluded another hidden auto-follow**, this time relocated to
+  `WAUSync/Protocols/USyncNewsletterProtocol.js` — a full duplicate of the newsletter socket
+  wrapped in a differently-named, differently-located file (not the obvious `newsletter.js`),
+  containing the same style of hardcoded-JIDs-plus-`setTimeout` forced channel-follow this fork
+  already removed once from `Socket/newsletter.js`. Skipped entirely — this fork already has
+  equivalent (and better, with the channel-follow guard and the metadata bug fixes) newsletter
+  functionality, so there was nothing legitimate in that file worth taking anyway.
+- `Socket/interactive-handler.js` (the source `sendStatusWhatsApp` was extracted from) and
+  `Types/Newsletter.js` (the source the `XWAPaths`/`QueryIds` additions above came from) were
+  not copied in as whole files — only the specific new capability/data from each was ported,
+  since the rest of both files duplicated functionality already present in this fork.
 
 ---
 

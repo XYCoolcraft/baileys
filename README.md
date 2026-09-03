@@ -36,10 +36,15 @@ Built on top of [Baileys](https://github.com/WhiskeySockets/Baileys) (WhiskeySoc
 - [Block all auto-join channels](#block-all-auto-join-channels)
 - [Guard against unexpected group-joins and DMs](#guard-against-unexpected-group-joins-and-dms)
 - [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-send-throttle)
+- [AntiBan (full send-safety suite)](#antiban-full-send-safety-suite)
 - [AI watermark on button messages](#ai-watermark-on-button-messages)
 - [ACK monitor](#ack-monitor)
 - [New in this fork: protocol & utility modules](#new-in-this-fork-protocol--utility-modules)
 - [Performance notes](#performance-notes)
+- [Posting a Status with mentions](#posting-a-status-with-mentions)
+- [Reading channel text status, business profiles, and more via USync](#reading-channel-text-status-business-profiles-and-more-via-usync)
+- [Pure-JS Curve25519 fallback](#pure-js-curve25519-fallback)
+- [SQLite-backed auth state](#sqlite-backed-auth-state)
 - [Storing data](#storing-data)
 - [Sending messages](#sending-messages)
 - [Simple send helpers](#simple-sendmessage-helpers)
@@ -414,6 +419,107 @@ const sock = makeWASocket({
 
 ---
 
+## AntiBan (full send-safety suite)
+
+Don't confuse this with **AntiBanned** above — they're two independent features with similar
+names on purpose (both aim at "don't get your number banned"), but very different scope:
+
+| | **AntiBanned** (previous section) | **AntiBan** (this section) |
+| --- | --- | --- |
+| Scope | Just a fresh-number daily send-limit ramp | Full suite: rate limiting, warm-up, health scoring, reachout-timelock guard, reply-ratio guard, contact-graph pacing, presence choreography, retry-spiral tracking, post-reconnect throttling, LID/JID canonicalization, session-stability monitoring |
+| Default | **OFF** (`antiBanned.enabled: false`) | **ON** (`antiban: 'aggressive'` preset) |
+| Where wired | A hook in `sendMessage` (`lib/Socket/messages-send.js`) | Wraps the whole socket in `lib/Socket/index.js` (`makeWASocket`) |
+| Config key | `antiBanned` | `antiban` |
+
+`AntiBan` is the standalone module from [`lib/antiban.js`](lib/antiban.js), wired automatically
+into every socket `makeWASocket()` returns. You don't need to import or instantiate anything —
+it's already attached at `sock.antiban`:
+
+```javascript
+import makeWASocket from '@xayz/baileys';
+
+const sock = makeWASocket({ auth: state });
+
+// already active — inspect it any time:
+console.log(sock.antiban.getStats());
+```
+
+```json
+{
+  "messagesAllowed": 0,
+  "messagesBlocked": 0,
+  "totalDelayMs": 0,
+  "health": { "risk": "low", "score": 0, "reasons": ["No issues detected"], "recommendation": "Operating normally. Continue monitoring." },
+  "warmUp": { "phase": "warming", "day": 1, "totalDays": 4, "todayLimit": 35, "todaySent": 0, "progress": 0 },
+  "rateLimiter": { "lastMinute": 0, "lastHour": 0, "lastDay": 0, "limits": { "perMinute": 20, "perHour": 800, "perDay": 4000 }, "knownChats": 0 }
+}
+```
+
+Every call to `sock.sendMessage(...)` is routed through `sock.antiban.beforeSend()` first —
+it may add a human-like delay, or block the send outright (throwing, with a reason) if the
+rate limit, warm-up ramp, health score, timelock, reply-ratio, or contact-graph checks say no.
+
+### Presets
+
+Pick one with `antiban: '<preset>'`, or override individual fields (see below):
+
+| Preset | msgs/min | msgs/hour | msgs/day | warm-up days | delay range |
+| --- | --- | --- | --- | --- | --- |
+| `conservative` | 5 | 100 | 800 | 10 | 2.5s – 7s |
+| `moderate` | 10 | 300 | 1,500 | 7 | 1.5s – 5s |
+| **`aggressive`** (default) | 20 | 800 | 4,000 | 4 | 0.8s – 3s |
+
+```javascript
+const sock = makeWASocket({ antiban: 'conservative' });
+```
+
+### Turning it off
+
+```javascript
+const sock = makeWASocket({ antiban: false });
+// sock.antiban is undefined — sendMessage behaves exactly as upstream Baileys
+```
+
+### Custom config (override specific fields on top of a preset)
+
+```javascript
+const sock = makeWASocket({
+  antiban: {
+    preset: 'moderate',
+    maxPerMinute: 15,       // override just this field
+    groupMultiplier: 0.6,   // messages to groups count for less against the limit
+    persist: './antiban-state.json' // survive restarts (rate-limit + warm-up state)
+  }
+});
+```
+
+### What you get on `sock.antiban`
+
+| Member | What it does |
+| --- | --- |
+| `sock.antiban.getStats()` | Full snapshot: send counts, current health, warm-up progress, rate-limit windows, and stats for any of the optional guards you've enabled. |
+| `sock.antiban.stats` | Just the raw allowed/blocked/delay counters (subset of `getStats()`). |
+| `sock.antiban.pause()` / `.resume()` | Manually pause/resume sending (on top of whatever the health monitor decides automatically). |
+| `sock.antiban.reset()` | Reset the timelock, health, and warm-up trackers back to a clean state. |
+| `sock.antiban.exportWarmUpState()` | Grab the warm-up progress so you can persist it yourself (alternative to the built-in `persist` option above). |
+| `sock.antiban.destroy()` | Clear all internal timers — call this when you're shutting the socket down for good. |
+
+**Not enabled by default**, but available through the same `antiban` config object if you need
+them: `replyRatio`, `contactGraph`, `presence`, `retryTracker`, `reconnectThrottle`,
+`jidCanonicalizer`/`lidResolver`, and `sessionStability`. These map to the legacy nested-config
+shape (`{ rateLimiter: {...}, warmUp: {...}, health: {...}, replyRatio: {...}, ... }`) if you'd
+rather configure each sub-module directly instead of using a flat preset+overrides object — both
+shapes are accepted. See [`LITERACY.md` → AntiBan](LITERACY.md#antiban-full-send-safety-suite)
+for what each sub-module does and how they fit together.
+
+> Same disclaimer as everywhere else in this README: none of this *guarantees* your number
+> won't get banned — WhatsApp doesn't publish its detection logic, and this fork doesn't know
+> it either. It reduces obviously-automated patterns (bursty sends, identical timing, zero
+> warm-up on a new number); it isn't a magic shield. Use responsibly, see
+> [Disclaimer](#disclaimer).
+
+---
+
 ## AI watermark on button messages
 
 Separate from `aiLabel` (which is about WhatsApp's business/bot-account label and applies
@@ -609,6 +715,83 @@ const tuner = optiMazer({ userDevicesCacheMaxKeys: 500 }).attach(sock);
 // later
 tuner.stop();
 ```
+
+---
+
+## Posting a Status with mentions
+
+```javascript
+await sock.sendStatusWhatsApp(
+  { text: 'Big announcement! 🎉', backgroundColor: '#00A884' },
+  ['6281234567890@s.whatsapp.net', '120363111111111111@g.us'] // users and/or groups (expanded to members)
+);
+```
+
+Everyone listed gets a "you were mentioned in a status" notification, same as posting a status
+with @mentions from the app.
+
+---
+
+## Reading channel text status, business profiles, and more via USync
+
+`USyncQuery` gained five more protocols for bulk-looking-up info about JIDs:
+
+```javascript
+import { USyncQuery, USyncUser } from '@xayz/baileys';
+
+const query = new USyncQuery()
+  .withTextStatusProtocol()
+  .withBusinessProtocol()
+  .withPictureProtocol()
+  .withUser(new USyncUser().withId(jid));
+
+const result = await sock.executeUSyncQuery(query);
+```
+
+`.withFeatureProtocol()` and `.withSidelistProtocol()` are also available. See
+[LITERACY.md](LITERACY.md#deeper-fork-comparison--what-schema-only-diffing-missed) for what
+each one returns.
+
+---
+
+## Pure-JS Curve25519 fallback
+
+If the `libsignal` dependency (currently a `github:` install — see
+[`vendor-libsignal.sh`](vendor-libsignal.sh)) ever fails to install or load in your
+environment, `CurveJS` is a drop-in, dependency-free replacement for the `Curve` operations it
+normally provides:
+
+```javascript
+import { CurveJS } from '@xayz/baileys';
+
+const keyPair = CurveJS.generateKeyPair();
+const shared = CurveJS.sharedKey(myPrivateKey, theirPublicKey);
+```
+
+It's verified interoperable with the default `Curve` (a shared key computed with `Curve` on
+one side and `CurveJS` on the other matches bit-for-bit) — see LITERACY.md for the test.
+Not used by default anywhere in the library; this is available if you need it.
+
+---
+
+## SQLite-backed auth state
+
+An alternative to `useMultiFileAuthState` for busy bots — stores everything in one SQLite file
+instead of one JSON file per key:
+
+```javascript
+import makeWASocket, { useSqliteAuthState } from '@xayz/baileys';
+
+const { state, saveCreds } = await useSqliteAuthState('./auth', {
+  migrateFromFolder: './old-multi-file-auth' // optional, one-time
+});
+
+const sock = makeWASocket({ auth: state });
+sock.ev.on('creds.update', saveCreds);
+```
+
+Requires Node 22.5+ (built-in `node:sqlite`); throws a clear error telling you to use
+`useMultiFileAuthState` instead on older Node.
 
 ---
 
