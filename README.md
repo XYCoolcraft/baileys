@@ -37,6 +37,7 @@ Built on top of [Baileys](https://github.com/WhiskeySockets/Baileys) (WhiskeySoc
 - [Guard against unexpected group-joins and DMs](#guard-against-unexpected-group-joins-and-dms)
 - [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-send-throttle)
 - [AntiBan (full send-safety suite)](#antiban-full-send-safety-suite)
+- [Message-builder (extra send helpers)](#message-builder-extra-send-helpers)
 - [AI watermark on button messages](#ai-watermark-on-button-messages)
 - [ACK monitor](#ack-monitor)
 - [New in this fork: protocol & utility modules](#new-in-this-fork-protocol--utility-modules)
@@ -427,20 +428,23 @@ names on purpose (both aim at "don't get your number banned"), but very differen
 | | **AntiBanned** (previous section) | **AntiBan** (this section) |
 | --- | --- | --- |
 | Scope | Just a fresh-number daily send-limit ramp | Full suite: rate limiting, warm-up, health scoring, reachout-timelock guard, reply-ratio guard, contact-graph pacing, presence choreography, retry-spiral tracking, post-reconnect throttling, LID/JID canonicalization, session-stability monitoring |
-| Default | **OFF** (`antiBanned.enabled: false`) | **ON** (`antiban: 'aggressive'` preset) |
+| Default | **OFF** (`antiBanned.enabled: false`) | **OFF** (opt in with `antiban: true` or a preset) |
 | Where wired | A hook in `sendMessage` (`lib/Socket/messages-send.js`) | Wraps the whole socket in `lib/Socket/index.js` (`makeWASocket`) |
 | Config key | `antiBanned` | `antiban` |
 
-`AntiBan` is the standalone module from [`lib/antiban.js`](lib/antiban.js), wired automatically
-into every socket `makeWASocket()` returns. You don't need to import or instantiate anything —
-it's already attached at `sock.antiban`:
+`AntiBan` is the standalone module from [`lib/antiban.js`](lib/antiban.js). It's **off by
+default** — nothing changes for you unless you opt in — and when you do, it's wired
+automatically into every socket `makeWASocket()` returns; you don't need to import or
+instantiate anything yourself, it just shows up at `sock.antiban`:
 
 ```javascript
 import makeWASocket from '@xayz/baileys';
 
-const sock = makeWASocket({ auth: state });
+const sock = makeWASocket({
+  auth: state,
+  antiban: true // opt in — uses the 'aggressive' preset. Omit this and antiban does nothing.
+});
 
-// already active — inspect it any time:
 console.log(sock.antiban.getStats());
 ```
 
@@ -455,29 +459,34 @@ console.log(sock.antiban.getStats());
 }
 ```
 
-Every call to `sock.sendMessage(...)` is routed through `sock.antiban.beforeSend()` first —
-it may add a human-like delay, or block the send outright (throwing, with a reason) if the
-rate limit, warm-up ramp, health score, timelock, reply-ratio, or contact-graph checks say no.
+Once enabled, every call to `sock.sendMessage(...)` — including the ones made internally by
+`sock.sendActionPoll()`, `sock.forwardMessage()`, etc. from the [message-builder helpers
+below](#message-builder-extra-send-helpers) — is routed through `sock.antiban.beforeSend()`
+first. It may add a human-like delay, or block the send outright (throwing, with a reason) if
+the rate limit, warm-up ramp, health score, timelock, reply-ratio, or contact-graph checks say
+no. Leave `antiban` unset (or `false`) and none of this runs — `sendMessage` behaves exactly
+like upstream Baileys, with zero added latency.
 
 ### Presets
 
-Pick one with `antiban: '<preset>'`, or override individual fields (see below):
+Turn it on with `antiban: true` (uses `aggressive`), `antiban: '<preset>'`, or override
+individual fields (see below):
 
 | Preset | msgs/min | msgs/hour | msgs/day | warm-up days | delay range |
 | --- | --- | --- | --- | --- | --- |
 | `conservative` | 5 | 100 | 800 | 10 | 2.5s – 7s |
 | `moderate` | 10 | 300 | 1,500 | 7 | 1.5s – 5s |
-| **`aggressive`** (default) | 20 | 800 | 4,000 | 4 | 0.8s – 3s |
+| `aggressive` (used by `antiban: true`) | 20 | 800 | 4,000 | 4 | 0.8s – 3s |
 
 ```javascript
 const sock = makeWASocket({ antiban: 'conservative' });
 ```
 
-### Turning it off
+### Leaving it off (the default — no action needed)
 
 ```javascript
-const sock = makeWASocket({ antiban: false });
-// sock.antiban is undefined — sendMessage behaves exactly as upstream Baileys
+const sock = makeWASocket({ auth: state });
+// no `antiban` key at all -> sock.antiban is undefined, sendMessage is untouched
 ```
 
 ### Custom config (override specific fields on top of a preset)
@@ -517,6 +526,57 @@ for what each sub-module does and how they fit together.
 > it either. It reduces obviously-automated patterns (bursty sends, identical timing, zero
 > warm-up on a new number); it isn't a magic shield. Use responsibly, see
 > [Disclaimer](#disclaimer).
+
+---
+
+## Message-builder (extra send helpers)
+
+A set of convenience methods bolted onto every socket for content types that would otherwise
+need you to hand-build a `generateWAMessageFromContent` payload yourself. Always on, no config
+— see [`lib/Socket/message-builder.js`](lib/Socket/message-builder.js):
+
+```javascript
+await sock.sendActionPoll(jid, { name: 'Pick a time', options: ['6pm', '7pm', '8pm'] });
+await sock.sendAlbumMessage(jid, [{ image: { url: './a.jpg' } }, { image: { url: './b.jpg' } }]);
+await sock.sendButtonsMessage(jid, { text: 'Choose one', buttons: [{ id: '1', text: 'Yes' }] });
+await sock.sendListMessage(jid, { text: 'Menu', sections: [...] });
+await sock.sendCarouselMessage(jid, { cards: [...] });
+await sock.sendVCard(jid, { name: 'Jane Doe', phone: '+1234567890' });
+await sock.forwardMessage(jid, originalMsg);
+await sock.broadcastMessage(jidList, { text: 'Announcement' });
+```
+
+If you have `antiban: true` (or a preset) set, these all go through it too — `forwardMessage`,
+`sendActionPoll`, and `broadcastMessage` call `sock.sendMessage()` internally, same as calling
+it yourself. (`sendJsonMessage`/`sendCarouselMessage` use the lower-level `relayMessage()` and
+so bypass antiban's rate limiting the same way any direct `relayMessage()` call would — see
+[`LITERACY.md` → Message-builder](LITERACY.md#message-builder-extra-send-helpers).)
+
+### Sticker packs
+
+`AntiBan`'s sibling feature — send a whole pack of stickers (plus tray icon) in one message,
+or auto-convert an image/video into a single sticker without a separate conversion step:
+
+```javascript
+// a whole pack:
+await sock.sendMessage(jid, {
+  stickerPacks: {
+    name: 'My Pack',
+    publisher: 'Me',
+    stickers: [
+      { image: './cat.png', emojis: ['🐱'] },
+      { image: './dog.mp4', animated: true, emojis: ['🐶'] }
+    ]
+  }
+});
+
+// one image/video, auto-converted (needs `ffmpeg` on PATH):
+await sock.sendMessage(jid, { sticker: './photo.jpg', pack: 'My Pack', author: 'Me' });
+```
+
+Plain `{ sticker: <already-a-webp-buffer> }` with none of `pack`/`author`/`isPrivate`/
+`animated`/`premium` set still works exactly as before — this only kicks in when you pass one
+of those extra options, signaling you want the auto-convert path.
 
 ---
 

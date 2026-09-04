@@ -20,11 +20,12 @@
 6. [Channel-follow guard](#channel-follow-guard-block-all-auto-join-channels)
 7. [AntiBanned (fresh-number throttle)](#antibanned-fresh-number-throttle)
 8. [AntiBan (full send-safety suite)](#antiban-full-send-safety-suite)
-9. [Changelog vs upstream](#changelog-vs-upstream)
-10. [New modules in this fork](#new-modules-in-this-fork)
-11. [Pairing-code testing](#pairing-code-testing--what-was-and-wasnt-verified)
-12. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
-13. [FAQ](#8-faq)
+9. [Message-builder (extra send helpers)](#message-builder-extra-send-helpers)
+10. [Changelog vs upstream](#changelog-vs-upstream)
+11. [New modules in this fork](#new-modules-in-this-fork)
+12. [Pairing-code testing](#pairing-code-testing--what-was-and-wasnt-verified)
+13. [`upload-npm.sh` walkthrough](#uploadnpmsh-walkthrough)
+14. [FAQ](#8-faq)
 
 ---
 
@@ -280,15 +281,19 @@ any other `lib/` module), wired in with a single call in `lib/Socket/index.js`:
 // lib/Socket/index.js
 import { wrapSocket } from '../antiban.js';
 // ...after every other socket layer is composed (communities, AI groups, privacy,
-// registration, managed-account, interop, GraphQL), and before attachTextRouter:
-if (newConfig.antiban !== false) {
-    sock = wrapSocket(sock, newConfig.antiban || 'aggressive');
+// registration, managed-account, interop, GraphQL), and before message-builder/attachTextRouter:
+if (newConfig.antiban) {
+    sock = wrapSocket(sock, newConfig.antiban === true ? 'aggressive' : newConfig.antiban);
 }
 ```
 
-**Config default:** `lib/Socket/index.js` → `'aggressive'` preset, applied unconditionally
-unless `config.antiban === false`. Unlike `antiBanned` above, this one is **on by default** —
-the fork's position is that basic send-safety shouldn't require opt-in wiring.
+**Config default:** OFF. `newConfig.antiban` is falsy unless you set it, so `wrapSocket()` is
+never called and `sock.antiban` is simply `undefined` — `sendMessage` behaves exactly like
+upstream Baileys with zero added latency. Opt in with `antiban: true` (resolves to the
+`'aggressive'` preset), a preset name string, or a config object. This was flipped from
+on-by-default to opt-in on request — see [Changelog vs upstream](#changelog-vs-upstream) — to
+match `antiBanned`'s opt-in convention above, rather than every socket paying antiban's added
+per-send latency whether or not the caller wanted it.
 
 The `## AntiBanned` section above says content variation, fingerprint spoofing, proxy rotation,
 and human-timing simulation are "deliberately out of scope" for that module — **this is where
@@ -312,8 +317,7 @@ function wrapSocket(sock, config, warmUpState, wrapOptions) {
 
   // 2. Wrap sendMessage so every outgoing message passes through beforeSend()/afterSend():
   const originalSendMessage = sock.sendMessage.bind(sock);
-  const wrapped = Object.create(sock);
-  wrapped.sendMessage = async (jid, content, options) => {
+  const wrappedSendMessage = async (jid, content, options) => {
     const decision = await antiban.beforeSend(jid, content?.text ?? '');
     if (!decision.allowed) throw new Error(`[baileys-antiban] Message blocked: ${decision.reason}`);
     if (decision.delayMs > 0) await sleep(decision.delayMs);
@@ -321,8 +325,16 @@ function wrapSocket(sock, config, warmUpState, wrapOptions) {
     antiban.afterSend(jid, content?.text ?? '');
     return result;
   };
-  wrapped.antiban = antiban; // <- this is what you see as sock.antiban
-  return wrapped;
+  // Plain spread — NOT Object.create(sock) — matching every other socket layer
+  // in this codebase (message-builder.js, text-router.js, etc. all do
+  // `{...sock, newMethod}`). Object.create(sock) puts sock's own properties on
+  // the *prototype* of the wrapped object instead of copying them as own
+  // properties; that's invisible to plain property access, but a later layer
+  // doing `{...sock}` (object spread only copies OWN enumerable properties)
+  // would silently drop everything — which is exactly what broke when
+  // message-builder.js was first wired in after this, until this was fixed.
+  const wrapped = { ...sock, sendMessage: wrappedSendMessage, antiban };
+  return wrapped; // <- sock.antiban is what you see as sock.antiban
 }
 ```
 
@@ -403,6 +415,75 @@ send path — confirming the wrap sits in front of, not beside, the real send.
 
 **To enable, tune, or disable it**, see
 [README → AntiBan](README.md#antiban-full-send-safety-suite).
+
+---
+
+## Message-builder (extra send helpers)
+
+**Where:** [`lib/Socket/message-builder.js`](lib/Socket/message-builder.js), the last socket
+layer composed in `makeWASocket()` — after antiban (see above), before `attachTextRouter`:
+
+```javascript
+// lib/Socket/index.js
+sock = makeGraphQLSocket(sock);
+if (newConfig.antiban) { sock = wrapSocket(sock, ...); }
+sock = makeMessageBuilderSocket(sock);  // <- captures sock.sendMessage/relayMessage here
+sock = attachTextRouter(sock);
+```
+
+Always on, no config key — unlike antiban and antiBanned, this is purely additive (new methods,
+nothing intercepted or blocked), so there's nothing to opt in or out of.
+
+**Why the ordering matters:** `makeMessageBuilderSocket(sock)` destructures
+`const { relayMessage, sendMessage, waUploadToServer } = sock` at call time, capturing whatever
+those three are *at that point in the chain*. Placing it after the antiban wrap means its
+`sendMessage`-based helpers (`sendActionPoll`, `forwardMessage`, `broadcastMessage`) go through
+antiban's rate limiting/delay when antiban is enabled, same as calling `sock.sendMessage()`
+yourself would. Its `relayMessage`-based helpers (`sendJsonMessage`, and anything built on top
+of it like `sendCarouselMessage`) do **not** — antiban's `wrapSocket()` only wraps
+`sendMessage`, not `relayMessage`, so these bypass it the same way a direct `sock.relayMessage()`
+call from your own code already would. This isn't a regression introduced by adding this file;
+it's an existing property of how antiban's wrap is scoped, just worth knowing about here.
+
+**Methods added:** `sendJsonMessage`, `sendActionPoll`, `resolvePollAction`,
+`sendAlbumMessage`, `sendStatusMention`, `sendRichResponse`, `sendButtonsMessage`,
+`sendListMessage`, `sendCarouselMessage`, `forwardMessage`, `sendVCard`, `broadcastMessage`.
+Depends only on already-existing exports (`generateWAMessageFromContent`,
+`prepareWAMessageMedia` from `lib/Utils/messages.js` — both present in this fork already, no
+new dependency needed) plus `WAProto` and Node's `crypto`.
+
+**Relationship to `lib/Socket/luxu.js`:** this fork already has send helpers for a similar
+purpose — polls, albums, order/event/group-status messages — but `luxu.js` works by pattern-
+matching the *shape* of whatever you pass to `sock.sendMessage()` (a `detectType()` dispatcher),
+not by exposing separate named methods. No overlap in names, no behavior conflict; the two are
+independent, complementary APIs for related goals; use whichever fits how you're already
+calling things.
+
+**Sticker packs**, `lib/Utils/messages.js`'s `stickerPacks` content type (send a whole pack of
+stickers + tray icon in one message) and the enhanced auto-convert `sticker` content type, are
+a related but separate addition — see [Changelog vs upstream](#changelog-vs-upstream) below for
+exactly what was added to `lib/Utils/messages.js` and `lib/Utils/sticker.js`/
+`lib/Utils/messages-media.js` for this. Quick example:
+
+```javascript
+await sock.sendMessage(jid, {
+  stickerPacks: {
+    name: 'My Pack',
+    publisher: 'Me',
+    stickers: [{ image: './cat.png', emojis: ['🐱'] }]
+  }
+});
+```
+
+**Verified end-to-end:** built against a real `makeWASocket()` call — `sock.sendVCard`,
+`sock.sendActionPoll`, `sock.forwardMessage`, `sock.broadcastMessage`, etc. are all present and
+are functions; with `antiban: true` also set, `sock.ev`, `sock.sendVCard`, and `sock.onText`
+(from `attachTextRouter`, the layer after this one) all remained intact — the regression test
+that caught bug #18 in the changelog below. `crc32()` checked against the standard CRC-32 test
+vector; `buildZipArchive()`'s output opened correctly with the real `unzip` command-line tool;
+`makeSticker()`/`convertToTrayIcon()` run against a real `ffmpeg` binary produced valid
+RIFF/WEBP and PNG buffers respectively; `generateWAMessageFromContent()` tested for both a
+plain-text regression (unaffected) and the new raw-proto-key fallback path.
 
 ---
 
@@ -518,6 +599,72 @@ send path — confirming the wrap sits in front of, not beside, the real send.
       a full channel link (`https://whatsapp.com/channel/<code>`) or passes through a bare
       code unchanged, since `newsletterMetadata('invite', code)` needs just the code, not the
       full link. See README.md → "Getting a channel's JID from its link".
+- **Merged in missing files/functionality found by comparing against `xayz@6.0.4`**
+  (`@xayz/baileys`, reviewed file-by-file — every file present in both packages was diffed
+  by its actual exported/declared names and, for anything carrying numeric IDs, by the ID
+  values themselves, not just line-count or export-count):
+  11. Added [`lib/Socket/message-builder.js`](lib/Socket/message-builder.js) — the only file
+      present in 6.0.4 and missing here entirely. Adds `sendActionPoll`, `sendAlbumMessage`,
+      `sendButtonsMessage`, `sendListMessage`, `sendCarouselMessage`, `sendVCard`,
+      `forwardMessage`, `broadcastMessage`, and others. No name collisions with this fork's
+      existing `lib/Socket/luxu.js` (different design: luxu.js works via content-type
+      detection inside `sendMessage`, this adds explicit named methods) — both coexist. Wired
+      in *after* the antiban wrap (see below) so these helpers' `sendMessage()`-based calls
+      still go through antiban when it's enabled. See README.md → "Message-builder".
+  12. Added sticker-pack support: `crc32`/`buildZipArchive`/`resolveStickerBuffer`
+      (`lib/Utils/messages-media.js`) and `isLikelyVideoBuffer`/`convertToWebp`/
+      `convertToTrayIcon`/`writeExifToWebp`/`makeSticker` (`lib/Utils/sticker.js`, a second,
+      independent conversion path alongside the existing `sharp`-based one — no functions
+      removed or renamed). Wired into `generateWAMessageFromContent()`
+      (`lib/Utils/messages.js`) as a new `stickerPacks` content type, plus an auto-convert path
+      for the existing `sticker` content type when `pack`/`author`/`isPrivate`/`animated`/
+      `premium` are set. See README.md → "Sticker packs".
+  13. Added `RAW_PROTO_MESSAGE_KEYS` + a fallback branch in `generateWAMessageFromContent()`
+      (`lib/Utils/messages.js`) — lets a caller pass a raw proto message-type key directly
+      (e.g. `{ conversation: 'hi' }`, `{ extendedTextMessage: {...} }`) and have it go straight
+      to `proto.Message.fromObject()`, bypassing content-type detection. Only reached as the
+      final fallback, after every existing content-type branch — no existing behavior changed.
+  14. **Bug fix**: `lib/Socket/interop.js`'s `INTEROP_MEX_QUERY_IDS` — all 7 query IDs
+      (`CREATE_GROUP`, `LEAVE_GROUP`, `ADD_PARTICIPANTS`, `QUERY_GROUP_INFO`,
+      `PRIVACY_SETTINGS_QUERY`, `PRIVACY_SETTINGS_UPDATE`,
+      `PRIVACY_SETTINGS_WITH_CONTACT_LIST`) were each off by ±1 or ±2 from the correct value —
+      a pattern too uniform across all 7 to be a legitimate independent re-derivation. A query
+      ID off by even one digit is rejected by WhatsApp's MEX server as unknown, so the interop
+      group (BirdyChat/Haiket) functions built on these were very likely non-functional before
+      this fix. Corrected against 6.0.4's values.
+  15. **Updated**: `lib/Socket/username.js`'s `USERNAME_QUERY_IDS.CHECK`/`CHECK_MULTI`/`GET`/
+      `GET_RECOMMENDATIONS` — this fork's values were sourced from a Java decompile of WA APK
+      2.26.17.2; 6.0.4's are sourced from a newer APK (2.26.26.4) cross-checked against a live
+      Frida capture dated 2026-06-30. `SET` and `PIN_SET` were already identical between the
+      two and were left unchanged.
+  16. **Bug fix**: `lib/Socket/mex.js`'s `executeWMexQuery()` called `JSON.parse()` directly on
+      the raw server response with no error handling — a response with a stray leading NUL
+      byte (which some server responses include) or genuinely malformed JSON would throw an
+      *uncaught* `SyntaxError` instead of the intended `Boom` error. Now strips leading NUL
+      bytes/whitespace first and wraps the parse in try/catch, falling through to the existing
+      generic "unexpected response structure" error path on failure — same defensive handling
+      6.0.4 already had.
+  17. **Flipped `antiban`'s default from on to off**, on request, to match `antiBanned`'s
+      opt-in convention: `if (newConfig.antiban) { sock = wrapSocket(...) }` instead of
+      `if (newConfig.antiban !== false)`. Opt in with `antiban: true` / a preset name / a
+      config object; unset (or `false`) means zero behavior change and zero added latency, same
+      as before this fork added antiban at all. See README.md → "AntiBan".
+  18. **Bug fix, found while wiring in #11 above**: `wrapSocket()`
+      (`lib/antiban.js`) returned its wrapped socket via `Object.create(sock)`, which puts
+      `sock`'s own properties (`ev`, `query`, every other layer's methods) on the *prototype*
+      of the returned object rather than copying them as own properties. That's invisible to
+      plain property access, but any layer composed *after* it that does `{...sock}` (object
+      spread only copies own enumerable properties — which is how every other layer in this
+      codebase, including the new message-builder.js, composes) would silently drop all of
+      them. Concretely: with antiban enabled, `attachTextRouter` crashed on
+      `sock.ev.on(...)` — `undefined.on`, `ev` had been dropped by message-builder.js's
+      `{...sock}` one layer up. Changed to a plain `{...sock, sendMessage, antiban}` spread,
+      matching the rest of the codebase's convention.
+  19. Nothing else showed a genuine gap: every other shared file's exported/declared names and,
+      for files carrying numeric query IDs (`graphql.js` — 225 IDs, `privacy.js` — 26 IDs),
+      the ID values themselves, matched exactly between the two packages. The remaining line-
+      level diff noise in files like `graphql.js`/`privacy.js`/`socket.js` is this fork's own
+      renaming/restructuring/comments, not missing functionality.
 - Everything else — the Signal/E2E implementation, binary node protocol, socket layers, media
   handling, etc. — is unchanged from upstream and still licensed MIT to the original authors
   (see [`LICENSE`](LICENSE)).

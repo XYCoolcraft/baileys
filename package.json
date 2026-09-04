@@ -1,7 +1,7 @@
 {
   "name": "@xayz/baileys",
   "type": "module",
-  "version": "6.0.6",
+  "version": "1.0.0",
   "description": "A WebSockets library for interacting with WhatsApp Web — XYCoolcraft fork of Baileys",
   "keywords": [
     "xycoolcraft",
