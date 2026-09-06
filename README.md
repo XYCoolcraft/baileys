@@ -428,23 +428,20 @@ names on purpose (both aim at "don't get your number banned"), but very differen
 | | **AntiBanned** (previous section) | **AntiBan** (this section) |
 | --- | --- | --- |
 | Scope | Just a fresh-number daily send-limit ramp | Full suite: rate limiting, warm-up, health scoring, reachout-timelock guard, reply-ratio guard, contact-graph pacing, presence choreography, retry-spiral tracking, post-reconnect throttling, LID/JID canonicalization, session-stability monitoring |
-| Default | **OFF** (`antiBanned.enabled: false`) | **OFF** (opt in with `antiban: true` or a preset) |
+| Default | **OFF** (`antiBanned.enabled: false`) | **ON** (`antiban: 'aggressive'` preset) |
 | Where wired | A hook in `sendMessage` (`lib/Socket/messages-send.js`) | Wraps the whole socket in `lib/Socket/index.js` (`makeWASocket`) |
 | Config key | `antiBanned` | `antiban` |
 
-`AntiBan` is the standalone module from [`lib/antiban.js`](lib/antiban.js). It's **off by
-default** — nothing changes for you unless you opt in — and when you do, it's wired
-automatically into every socket `makeWASocket()` returns; you don't need to import or
-instantiate anything yourself, it just shows up at `sock.antiban`:
+`AntiBan` is the standalone module from [`lib/antiban.js`](lib/antiban.js), wired automatically
+into every socket `makeWASocket()` returns. You don't need to import or instantiate anything —
+it's already attached at `sock.antiban`:
 
 ```javascript
 import makeWASocket from '@xayz/baileys';
 
-const sock = makeWASocket({
-  auth: state,
-  antiban: true // opt in — uses the 'aggressive' preset. Omit this and antiban does nothing.
-});
+const sock = makeWASocket({ auth: state });
 
+// already active — inspect it any time:
 console.log(sock.antiban.getStats());
 ```
 
@@ -459,34 +456,32 @@ console.log(sock.antiban.getStats());
 }
 ```
 
-Once enabled, every call to `sock.sendMessage(...)` — including the ones made internally by
+Every call to `sock.sendMessage(...)` — including the ones made internally by
 `sock.sendActionPoll()`, `sock.forwardMessage()`, etc. from the [message-builder helpers
 below](#message-builder-extra-send-helpers) — is routed through `sock.antiban.beforeSend()`
 first. It may add a human-like delay, or block the send outright (throwing, with a reason) if
 the rate limit, warm-up ramp, health score, timelock, reply-ratio, or contact-graph checks say
-no. Leave `antiban` unset (or `false`) and none of this runs — `sendMessage` behaves exactly
-like upstream Baileys, with zero added latency.
+no.
 
 ### Presets
 
-Turn it on with `antiban: true` (uses `aggressive`), `antiban: '<preset>'`, or override
-individual fields (see below):
+Pick one with `antiban: '<preset>'`, or override individual fields (see below):
 
 | Preset | msgs/min | msgs/hour | msgs/day | warm-up days | delay range |
 | --- | --- | --- | --- | --- | --- |
 | `conservative` | 5 | 100 | 800 | 10 | 2.5s – 7s |
 | `moderate` | 10 | 300 | 1,500 | 7 | 1.5s – 5s |
-| `aggressive` (used by `antiban: true`) | 20 | 800 | 4,000 | 4 | 0.8s – 3s |
+| **`aggressive`** (default) | 20 | 800 | 4,000 | 4 | 0.8s – 3s |
 
 ```javascript
 const sock = makeWASocket({ antiban: 'conservative' });
 ```
 
-### Leaving it off (the default — no action needed)
+### Turning it off
 
 ```javascript
-const sock = makeWASocket({ auth: state });
-// no `antiban` key at all -> sock.antiban is undefined, sendMessage is untouched
+const sock = makeWASocket({ antiban: false });
+// sock.antiban is undefined — sendMessage behaves exactly as upstream Baileys
 ```
 
 ### Custom config (override specific fields on top of a preset)

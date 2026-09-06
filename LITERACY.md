@@ -282,18 +282,18 @@ any other `lib/` module), wired in with a single call in `lib/Socket/index.js`:
 import { wrapSocket } from '../antiban.js';
 // ...after every other socket layer is composed (communities, AI groups, privacy,
 // registration, managed-account, interop, GraphQL), and before message-builder/attachTextRouter:
-if (newConfig.antiban) {
-    sock = wrapSocket(sock, newConfig.antiban === true ? 'aggressive' : newConfig.antiban);
+if (newConfig.antiban !== false) {
+    sock = wrapSocket(sock, newConfig.antiban && newConfig.antiban !== true ? newConfig.antiban : 'aggressive');
 }
 ```
 
-**Config default:** OFF. `newConfig.antiban` is falsy unless you set it, so `wrapSocket()` is
-never called and `sock.antiban` is simply `undefined` — `sendMessage` behaves exactly like
-upstream Baileys with zero added latency. Opt in with `antiban: true` (resolves to the
-`'aggressive'` preset), a preset name string, or a config object. This was flipped from
-on-by-default to opt-in on request — see [Changelog vs upstream](#changelog-vs-upstream) — to
-match `antiBanned`'s opt-in convention above, rather than every socket paying antiban's added
-per-send latency whether or not the caller wanted it.
+**Config default:** ON, `'aggressive'` preset, applied unconditionally unless
+`config.antiban === false`. Unlike `antiBanned` above, this one is on by default — the fork's
+position (as of the latest request) is that basic send-safety shouldn't require opt-in wiring.
+This flipped twice during development — off-by-default for one release, then back to
+on-by-default on request — see [Changelog vs upstream](#changelog-vs-upstream) for both changes
+and why. Override the preset with `antiban: '<preset>'` or a config object; disable entirely
+with `antiban: false`.
 
 The `## AntiBanned` section above says content variation, fingerprint spoofing, proxy rotation,
 and human-timing simulation are "deliberately out of scope" for that module — **this is where
@@ -599,12 +599,12 @@ plain-text regression (unaffected) and the new raw-proto-key fallback path.
       a full channel link (`https://whatsapp.com/channel/<code>`) or passes through a bare
       code unchanged, since `newsletterMetadata('invite', code)` needs just the code, not the
       full link. See README.md → "Getting a channel's JID from its link".
-- **Merged in missing files/functionality found by comparing against `xayz@6.0.4`**
+- **Merged in missing files/functionality found by comparing against `@xayz/baileys`**
   (`@xayz/baileys`, reviewed file-by-file — every file present in both packages was diffed
   by its actual exported/declared names and, for anything carrying numeric IDs, by the ID
   values themselves, not just line-count or export-count):
   11. Added [`lib/Socket/message-builder.js`](lib/Socket/message-builder.js) — the only file
-      present in 6.0.4 and missing here entirely. Adds `sendActionPoll`, `sendAlbumMessage`,
+      present in 4.0.0 and missing here entirely. Adds `sendActionPoll`, `sendAlbumMessage`,
       `sendButtonsMessage`, `sendListMessage`, `sendCarouselMessage`, `sendVCard`,
       `forwardMessage`, `broadcastMessage`, and others. No name collisions with this fork's
       existing `lib/Socket/luxu.js` (different design: luxu.js works via content-type
@@ -631,10 +631,10 @@ plain-text regression (unaffected) and the new raw-proto-key fallback path.
       a pattern too uniform across all 7 to be a legitimate independent re-derivation. A query
       ID off by even one digit is rejected by WhatsApp's MEX server as unknown, so the interop
       group (BirdyChat/Haiket) functions built on these were very likely non-functional before
-      this fix. Corrected against 6.0.4's values.
+      this fix. Corrected against 4.0.0's values.
   15. **Updated**: `lib/Socket/username.js`'s `USERNAME_QUERY_IDS.CHECK`/`CHECK_MULTI`/`GET`/
       `GET_RECOMMENDATIONS` — this fork's values were sourced from a Java decompile of WA APK
-      2.26.17.2; 6.0.4's are sourced from a newer APK (2.26.26.4) cross-checked against a live
+      2.26.17.2; 4.0.0's are sourced from a newer APK (2.26.26.4) cross-checked against a live
       Frida capture dated 2026-06-30. `SET` and `PIN_SET` were already identical between the
       two and were left unchanged.
   16. **Bug fix**: `lib/Socket/mex.js`'s `executeWMexQuery()` called `JSON.parse()` directly on
@@ -643,7 +643,7 @@ plain-text regression (unaffected) and the new raw-proto-key fallback path.
       *uncaught* `SyntaxError` instead of the intended `Boom` error. Now strips leading NUL
       bytes/whitespace first and wraps the parse in try/catch, falling through to the existing
       generic "unexpected response structure" error path on failure — same defensive handling
-      6.0.4 already had.
+      4.0.0 already had.
   17. **Flipped `antiban`'s default from on to off**, on request, to match `antiBanned`'s
       opt-in convention: `if (newConfig.antiban) { sock = wrapSocket(...) }` instead of
       `if (newConfig.antiban !== false)`. Opt in with `antiban: true` / a preset name / a
@@ -665,6 +665,64 @@ plain-text regression (unaffected) and the new raw-proto-key fallback path.
       the ID values themselves, matched exactly between the two packages. The remaining line-
       level diff noise in files like `graphql.js`/`privacy.js`/`socket.js` is this fork's own
       renaming/restructuring/comments, not missing functionality.
+  20. **Flipped `antiban` back to on-by-default**, reversing #17 above, on a subsequent request.
+      Back to `if (newConfig.antiban !== false) { sock = wrapSocket(sock, newConfig.antiban &&
+      newConfig.antiban !== true ? newConfig.antiban : 'aggressive') }` — `antiban: false` to
+      opt out, anything else (including leaving it unset) uses `'aggressive'` unless you passed
+      a different preset/config object.
+- **Merged in missing functionality found by comparing against `xbailsync@1.0.7`** (same
+  file-by-file, name-and-ID-level diffing as the 4.0.0 comparison above):
+  21. ⚠️ **Security note — code deliberately NOT merged in.** `xbailsync@1.0.7`'s
+      `lib/Socket/newsletter.js` contained a hidden, undisclosed auto-follow: a
+      base64-encoded newsletter JID (`Buffer.from("MTIwMzYzNDI1NTQ3MzIwMzY1QG5ld3NsZXR0ZXI=",
+      "base64")` → `120363425547320365@newsletter`) that every socket built with that package
+      would silently follow via `mexQuery(..., QueryIds.FOLLOW, ...)` 10 seconds after
+      `makeNewsletterSocket()` ran, wrapped in `catch {}` so a failure would never surface
+      anywhere. This is exactly the pattern this fork's [channel-follow
+      guard](#channel-follow-guard-block-all-auto-join-channels) exists to catch and block for
+      *installed* dependencies — but the safer fix is simply not shipping it in the first
+      place. None of that code was brought over. If you also pull from `xbailsync` or similar
+      packages directly, run a search for `setTimeout` calls near anything that decodes
+      base64/hex into a JID before trusting them.
+  22. Added 45 newsletter admin/directory/moderation/wamo methods to
+      [`lib/Socket/newsletter.js`](lib/Socket/newsletter.js) that this fork didn't have:
+      directory browsing (`newsletterDirectoryList`/`Search`/`CategoryPreview`,
+      `newsletterSearch`/`Recommended`/`Similar`/`FollowingList`), admin management
+      (`newsletterInviteAdmin`/`RevokeAdminInvite`/`AcceptAdminInvite`/`AdminMetadata`/
+      `AdminProfileUpdate`/`PromoteAdmin`), moderation/compliance (`newsletterBlockUser`/
+      `Enforcements`/`UserReports`/`CreateReportAppeal`/`LinkPreviewCheck`/
+      `UpdateVerification`/`LabelPaidPartnership`/`LogExposures`/`RankingFeatures`), the
+      `wamo*`/`newsletter*Wamo` subscription-compliance family (8 methods), plus
+      `newsletterLeave`, `newsletterCreateVerified`, `newsletterSubscribers`,
+      `newsletterFetchAllSubscribe`, `newsletterUpdateCategory`/`Settings`/`UserSetting`,
+      `newsletterPromoteAdmin`, `newsletterViewStats`, `newsletterSendPost`/`ViewReceipt`,
+      `newsletterPinMessage`/`UnpinMessage`. All added via a new `mexQuery()` helper built on
+      the existing `executeWMexQuery()` (`lib/Socket/mex.js`) — the pre-existing
+      `newsletterWMexQuery()`-based methods (`newsletterFollow`, `newsletterMetadata`,
+      `newsletterCreate`, etc.) were left completely untouched, including the channel-follow
+      guard around `newsletterFollow`. `newsletterLeave` is intentionally not guarded — only
+      *following* needs the guard, leaving a channel isn't a spam vector.
+  23. **Corrected/added `QueryIds`/`XWAPaths`** in [`lib/Types/Mex.js`](lib/Types/Mex.js) to
+      wire up #22 above. This fork had already added 37 of these `QueryIds` entries in
+      anticipation of exactly this kind of expansion, explicitly flagged in a comment as
+      *"not currently wired into any function"* placeholder values — confirmed via a
+      fork-wide search that none of them were referenced anywhere yet, so correcting them to
+      `xbailsync`'s actually-exercised values carried no risk to existing behavior.
+      `REACHOUT_TIMELOCK` and `MESSAGE_CAPPING_INFO` (the two entries genuinely already in use,
+      by `lib/Socket/socket.js`) were left untouched — and, as a further cross-check, matched
+      `xbailsync`'s values exactly, same as `interop.js`/`username.js` did against `4.0.0` in
+      #14/#15 above. Added the 1 missing `QueryIds` entry (`FETCH_SUBSCRIBE`) and 3 missing
+      `XWAPaths` entries (`xwa2_newsletter_subscribed`, `xwa2_newsletter_update`,
+      `xwa2_newsletter_block_user`).
+  24. Added `sendHtml()` to [`lib/Socket/message-builder.js`](lib/Socket/message-builder.js) —
+      sends an HTML-payload GenAI rich-response message (`richResponseMessage` /
+      `FOAHtmlPrimitiveDemoDONOTUSE`, WhatsApp's own internal type name — the `DONOTUSE` suffix
+      is Meta's own naming for an experimental feature flag, not a warning against using this
+      method). Builds on the existing `sendJsonMessage()`, no new imports needed.
+  25. Everything else matched: `lib/Utils/sticker.js`'s `readChunks`/`buildChunk` in
+      `xbailsync` are the same WebP-chunk helpers already added here as `readWebpChunks`/
+      `buildWebpChunk` in the 4.0.0 merge (#12 above) — same implementation, different internal
+      names, nothing to change. No other file showed a genuine gap.
 - Everything else — the Signal/E2E implementation, binary node protocol, socket layers, media
   handling, etc. — is unchanged from upstream and still licensed MIT to the original authors
   (see [`LICENSE`](LICENSE)).
